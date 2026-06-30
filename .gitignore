@@ -1,0 +1,38 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# ---- Environment ----
+.env
+
+# ---- Data & models (regenerated locally) ----
+data/raw/*
+data/processed/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+models/*
+!models/.gitkeep
+
+# ---- Jupyter ----
+.ipynb_checkpoints/
+
+# ---- OS / IDE ----
+.DS_Store
+.vscode/
+.idea/
+
+# ---- Testing ----
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ---- Logs & runtime state ----
+logs/
+data/processed/paper_state.json
