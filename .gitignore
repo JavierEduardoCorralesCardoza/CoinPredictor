@@ -36,3 +36,6 @@ htmlcov/
 # ---- Logs & runtime state ----
 logs/
 data/processed/paper_state.json
+
+# ---- Local tooling (portable gh CLI, etc.) ----
+.tools/
