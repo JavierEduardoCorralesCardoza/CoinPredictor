@@ -1,0 +1,25 @@
+services:
+  # Always-on Streamlit dashboard. Bound to localhost only — reach it
+  # remotely through your existing Cloudflare Tunnel, not by opening the port.
+  coinpredictor-dashboard:
+    build: .
+    image: coinpredictor:latest
+    command: ["streamlit", "run", "dashboard/app.py",
+              "--server.port=8501", "--server.address=0.0.0.0"]
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+    ports:
+      - "127.0.0.1:8501:8501"
+    restart: unless-stopped
+
+  # On-demand job container: NOT started by `docker compose up` (profile
+  # "cli"). The host's cron job runs it once a day via `docker compose run`.
+  coinpredictor:
+    build: .
+    image: coinpredictor:latest
+    profiles: ["cli"]
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./logs:/app/logs

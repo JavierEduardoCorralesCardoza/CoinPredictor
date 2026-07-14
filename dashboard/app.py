@@ -4,10 +4,13 @@ Run with:
     streamlit run dashboard/app.py
 
 Features:
-* Today's live forward-volatility forecast + regime (calm/elevated).
+* Today's live forward-volatility forecast + regime (calm/elevated), for the
+  primary production model.
 * Walk-forward backtest of a volatility-targeting strategy vs buy-and-hold.
 * Interactive price & realized-volatility charts.
 * Model feature-importance (explainability).
+* Track record comparing ALL registered models (coinpredictor.registry) side
+  by side, from their real daily predictions vs realized outcomes.
 """
 from __future__ import annotations
 
@@ -37,6 +40,8 @@ from coinpredictor.predict import predict_next_day  # noqa: E402
 
 st.set_page_config(page_title="CoinPredictor — BTC Volatility", layout="wide")
 
+_PREDICTION_LOG = _ROOT / "data" / "processed" / "prediction_log.csv"
+
 
 # --- Cached data/model helpers ----------------------------------------------
 @st.cache_data(show_spinner="Loading BTC data…")
@@ -47,6 +52,22 @@ def _get_features(refresh: bool) -> pd.DataFrame:
 @st.cache_data(show_spinner="Running walk-forward backtest…")
 def _get_backtest(_feats_key: str, feats: pd.DataFrame):
     return walk_forward_backtest(build_vol_regressor, feats)
+
+
+@st.cache_data(show_spinner="Loading prediction log…", ttl=300)
+def _get_prediction_log(_mtime: float) -> pd.DataFrame:
+    """Load the real daily prediction log (long format: one row per day per
+    model). _mtime busts the cache when the CSV changes on disk (cron run)."""
+    df = pd.read_csv(
+        _PREDICTION_LOG,
+        parse_dates=["run_at", "as_of_date", "target_date"],
+    )
+    for col in ("predicted_vol", "actual_vol", "abs_error", "trailing_vol"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    if "regime_correct" in df.columns:
+        df["regime_correct"] = df["regime_correct"].astype(str) == "True"
+    return df
 
 
 def _ensure_model(feats: pd.DataFrame):
@@ -81,7 +102,7 @@ st.caption(
     "more predictable than price direction."
 )
 
-# --- Live prediction ---------------------------------------------------------
+# --- Live prediction (primary production model) ------------------------------
 pred = predict_next_day(artifact=artifact, refresh=False)
 vol_delta = pred.predicted_vol - pred.trailing_vol
 c1, c2, c3, c4 = st.columns(4)
@@ -103,8 +124,8 @@ c4.metric(
 st.divider()
 
 # --- Tabs --------------------------------------------------------------------
-tab_chart, tab_backtest, tab_importance = st.tabs(
-    ["📈 Charts", "🧪 Backtest", "🔍 Explainability"]
+tab_chart, tab_backtest, tab_importance, tab_track = st.tabs(
+    ["📈 Charts", "🧪 Backtest", "🔍 Explainability", "📊 Track Record"]
 )
 
 with tab_chart:
@@ -194,3 +215,139 @@ with tab_importance:
         fig_imp = go.Figure(go.Bar(x=imp.values, y=imp.index, orientation="h"))
         fig_imp.update_layout(height=600, title="Top 20 feature importances")
         st.plotly_chart(fig_imp, use_container_width=True)
+
+with tab_track:
+    if not _PREDICTION_LOG.exists():
+        st.info(
+            "No predictions logged yet. The daily cron job will populate "
+            "data/processed/prediction_log.csv on its next run."
+        )
+    else:
+        log_mtime = _PREDICTION_LOG.stat().st_mtime
+        log_df = _get_prediction_log(log_mtime)
+
+        if "model_name" not in log_df.columns:
+            st.warning(
+                "This log predates the multi-model registry. Run "
+                "scripts/migrate_add_model_name.py to upgrade it."
+            )
+        else:
+            all_models = sorted(log_df["model_name"].unique())
+            evaluated_all = log_df[log_df["status"] == "evaluated"].copy()
+            pending_all = log_df[log_df["status"] == "pending"].copy()
+
+            st.caption(
+                f"{len(log_df)} predictions logged across {len(all_models)} model(s) — "
+                f"{len(evaluated_all)} evaluated, {len(pending_all)} still pending."
+            )
+
+            # --- Leaderboard: one row per model, side by side -------------------
+            st.subheader("🏆 Model leaderboard")
+            if evaluated_all.empty:
+                st.info(
+                    "No evaluated predictions yet for any model. Each prediction "
+                    "needs its target_date to pass before it can be scored."
+                )
+            else:
+                rows = []
+                for name, grp in evaluated_all.groupby("model_name"):
+                    mae = grp["abs_error"].mean()
+                    rmse = (grp["abs_error"] ** 2).mean() ** 0.5
+                    acc = grp["regime_correct"].mean()
+                    rows.append(
+                        {
+                            "Model": name,
+                            "Evaluated": len(grp),
+                            "MAE": mae,
+                            "RMSE": rmse,
+                            "Regime accuracy": acc,
+                        }
+                    )
+                board = pd.DataFrame(rows).sort_values("MAE")
+                st.dataframe(
+                    board.style.format(
+                        {"MAE": "{:.2%}", "RMSE": "{:.2%}", "Regime accuracy": "{:.0%}"}
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                st.caption(
+                    "Lower MAE/RMSE is better. `naive_persistence_v1` (predicts "
+                    "tomorrow = today) is the bar every other model should clear — "
+                    "if a fancier model doesn't beat it, it isn't earning its "
+                    "complexity."
+                )
+
+            st.divider()
+
+            # --- Model selector for detail charts --------------------------------
+            selected = st.multiselect(
+                "Compare models in the charts below",
+                options=all_models,
+                default=all_models,
+            )
+            evaluated = evaluated_all[evaluated_all["model_name"].isin(selected)]
+
+            if evaluated.empty:
+                st.info("No evaluated predictions yet for the selected model(s).")
+            else:
+                fig_track = go.Figure()
+                colors = [
+                    "#2196f3", "#ff9800", "#4caf50", "#e91e63", "#9c27b0", "#795548",
+                ]
+                for idx, (name, grp) in enumerate(evaluated.groupby("model_name")):
+                    grp = grp.sort_values("as_of_date")
+                    color = colors[idx % len(colors)]
+                    fig_track.add_trace(
+                        go.Scatter(
+                            x=grp["as_of_date"], y=grp["predicted_vol"],
+                            name=f"{name} — predicted", mode="lines+markers",
+                            line=dict(color=color),
+                        )
+                    )
+                    fig_track.add_trace(
+                        go.Scatter(
+                            x=grp["as_of_date"], y=grp["actual_vol"],
+                            name=f"{name} — actual", mode="lines+markers",
+                            line=dict(color=color, dash="dot"),
+                        )
+                    )
+                fig_track.update_layout(
+                    height=440,
+                    title="Predicted vs. realized volatility, by model",
+                    yaxis_title="Annualized volatility",
+                    yaxis_tickformat=".0%",
+                )
+                st.plotly_chart(fig_track, use_container_width=True)
+
+                fig_mae = go.Figure()
+                for idx, (name, grp) in enumerate(evaluated.groupby("model_name")):
+                    grp = grp.sort_values("as_of_date").copy()
+                    grp["cumulative_mae"] = grp["abs_error"].expanding().mean()
+                    fig_mae.add_trace(
+                        go.Scatter(
+                            x=grp["as_of_date"], y=grp["cumulative_mae"],
+                            name=name, line=dict(color=colors[idx % len(colors)]),
+                        )
+                    )
+                fig_mae.update_layout(
+                    height=320,
+                    title="Cumulative MAE over time, by model",
+                    yaxis_title="Mean absolute error",
+                )
+                st.plotly_chart(fig_mae, use_container_width=True)
+
+            with st.expander("📋 Full prediction log (all models)", expanded=evaluated_all.empty):
+                display_cols = [
+                    c
+                    for c in [
+                        "as_of_date", "model_name", "target_type", "target_date", "status",
+                        "predicted_vol", "actual_vol", "regime_pred", "actual_regime",
+                        "regime_correct", "abs_error",
+                    ]
+                    if c in log_df.columns
+                ]
+                st.dataframe(
+                    log_df[display_cols].sort_values("as_of_date", ascending=False),
+                    use_container_width=True,
+                )
