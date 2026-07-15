@@ -24,6 +24,17 @@ python-dotenv>=1.0
 # Live price for the paper-trading bot (optional; falls back to cached close)
 ccxt>=4.2
 
+# Sentiment Tier 2 — FinBERT (financial-text BERT), runs locally on CPU, free
+# after a one-time model download. Needs torch: in Docker a CPU-only torch is
+# installed explicitly (see Dockerfile) to keep the image lean; for local dev
+# `pip install torch` if you want FinBERT to run (otherwise it degrades to the
+# free lexicon tier).
+transformers>=4.40
+
+# Paid tiers (Claude): LLM sentiment (Phase 2) + LLM Judge layer (Phase 3).
+# Pure-python, light; only imported when a paid flag is on.
+anthropic>=0.34
+
 # Notebooks
 jupyter>=1.0
 ipykernel>=6.25

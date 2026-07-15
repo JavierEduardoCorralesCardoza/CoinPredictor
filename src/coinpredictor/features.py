@@ -54,6 +54,36 @@ def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return tr.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
 
 
+def _adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Average Directional Index (Wilder) — trend-strength indicator in 0..100.
+
+    Higher ADX = stronger trend (regardless of direction); low ADX = ranging/
+    choppy market. Consumed both as a model feature and, in Phase 3, handed to
+    the LLM judge as an already-computed number to reason over qualitatively
+    (the judge never recomputes it — see the numeric-reasoning guardrail).
+    """
+    high, low, close = df["high"], df["low"], df["close"]
+    up_move = high.diff()
+    down_move = -low.diff()
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    plus_dm = pd.Series(plus_dm, index=df.index)
+    minus_dm = pd.Series(minus_dm, index=df.index)
+
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [high - low, (high - prev_close).abs(), (low - prev_close).abs()],
+        axis=1,
+    ).max(axis=1)
+
+    alpha = 1 / period
+    atr = tr.ewm(alpha=alpha, min_periods=period, adjust=False).mean()
+    plus_di = 100 * plus_dm.ewm(alpha=alpha, min_periods=period, adjust=False).mean() / atr
+    minus_di = 100 * minus_dm.ewm(alpha=alpha, min_periods=period, adjust=False).mean() / atr
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0.0, np.nan)
+    return dx.ewm(alpha=alpha, min_periods=period, adjust=False).mean()
+
+
 def _bollinger(close: pd.Series, period: int = 20, n_std: float = 2.0):
     sma = close.rolling(period).mean()
     std = close.rolling(period).std()
@@ -121,6 +151,7 @@ def build_features(
 
     # Volatility / range.
     out["atr_14"] = _atr(out, 14)
+    out["adx_14"] = _adx(out, 14)
     bb_width, bb_pct = _bollinger(close, 20)
     out["bb_width"] = bb_width
     out["bb_pct"] = bb_pct

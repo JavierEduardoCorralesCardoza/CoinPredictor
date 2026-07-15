@@ -142,3 +142,103 @@ verifies future prices never influence past feature values.
 | blockchain.info | On-chain metrics | No |
 | alternative.me | Fear & Greed index | No |
 | NewsAPI | Headline counts | Free key (optional) |
+| CoinDesk / Cointelegraph RSS | News headlines (sentiment) | No |
+
+## Hierarchical multi-model architecture
+
+Beyond the original volatility model, CoinPredictor runs several **model
+families** side by side. Each family has its OWN csv log, its OWN required
+naive/free baseline, and its OWN leaderboard metric (one leaderboard per family
+in the dashboard's Track Record tab).
+
+| Family | File | Baseline | Real model | Metric |
+| --- | --- | --- | --- | --- |
+| volatility | `volatility_log.csv` | `naive_persistence_v1` | `lgbm_volatility_v1` | MAE / RMSE |
+| trend regime | `trend_regime_log.csv` | `sma_cross_trend_v1` | `lgbm_trend_v1` | accuracy + per-class F1 |
+| entry | `entry_log.csv` | `baseline_entry_v1` | `lgbm_entry_v1` | precision / recall / calibration |
+| sentiment | `sentiment_log.csv` | `lexicon_sentiment_v1` | `finbert_sentiment_v1` | corr(score, fwd return) |
+| risk | `risk_policy_results.csv` | `buy_and_hold` | vol-target / Kelly | Sharpe / maxDD / Calmar |
+
+- **Trend regime** (`ALCISTA` / `BAJISTA` / `LATERAL`) is a *different* concept
+  from the volatility regime (`ELEVATED` / `CALM`) — separate columns, separate
+  file, no naming collision.
+- **Entry** uses **triple-barrier** labelling (take-profit / stop-loss / time,
+  using daily High/Low) to predict whether a long taken today would win.
+- **Risk** is not a daily row: `scripts/evaluate_risk_policies.py` replays each
+  position-sizing policy over history and writes one portfolio-level row each.
+
+Daily cron (unchanged, twice-daily, free):
+
+```bash
+python scripts/log_prediction.py       # one row per model into its family file
+python scripts/evaluate_predictions.py # scores rows whose target_date has passed
+```
+
+One-off migration from the legacy single log:
+
+```bash
+python scripts/migrate_split_by_target_type.py   # prediction_log.csv -> volatility_log.csv
+```
+
+## Cost discipline & paid capabilities (all OFF by default)
+
+Everything runs at **zero external API cost** by default. Each paid capability
+has its OWN dedicated flag (never one master switch) — see `.env.example`:
+
+| Flag | Enables | Requires |
+| --- | --- | --- |
+| `COINPREDICTOR_PAID_NEWS` | paid news provider on top of free RSS | `CRYPTOPANIC_KEY` or `NEWSAPI_KEY` |
+| `COINPREDICTOR_LLM_SENTIMENT` | Claude sentiment (Tier 3) | `ANTHROPIC_API_KEY` |
+| `COINPREDICTOR_JUDGE_ENABLED` | the LLM Judge layer (Phase 3) | `ANTHROPIC_API_KEY` |
+
+If a flag is ON but its key is missing, the code **fails loudly** rather than
+silently skipping.
+
+### Sentiment tiers (news → score)
+
+News headlines are pulled free from CoinDesk / Cointelegraph RSS (no key). Three
+scoring tiers:
+
+1. **Lexicon** (`lexicon_sentiment_v1`) — curated keyword lexicon. Deterministic,
+   dependency-free, always available. The zero-cost floor.
+2. **FinBERT** (`finbert_sentiment_v1`) — HuggingFace `ProsusAI/finbert`, runs
+   locally on CPU. **Recommended real model.** One-time download ≈ **440 MB**;
+   first run without a cached model takes a few minutes. In Docker it is
+   pre-downloaded at build time (`HF_HOME=/app/.cache/huggingface`) so the daily
+   job never fetches it. For local dev, `pip install torch` to enable it —
+   otherwise it degrades gracefully to the lexicon tier.
+3. **Claude** (`llm_sentiment_v1`) — paid, gated by `COINPREDICTOR_LLM_SENTIMENT`.
+   Not registered in `MODELS` by default.
+
+## LLM Judge layer (Phase 3, disabled by default)
+
+A **separate, non-deterministic** decision layer (`src/coinpredictor/judges.py`)
+that consumes each family's *primary* model output plus raw indicators and
+sentiment, and emits a `BUY` / `HOLD` / `SELL` verdict with reasoning. It is
+architecturally separate from `MODELS` (judged on decision quality, never on
+MAE/accuracy) and **never** appears in the ML leaderboards.
+
+- Disabled by default (`COINPREDICTOR_JUDGE_ENABLED=false`) — makes zero API
+  calls until you flip the flag.
+- Its own once-daily, cost-bearing cron entry (`scripts/run_judge.py`), **not**
+  merged into the twice-daily free job.
+- Hard daily spend cap (`JudgeConfig.max_daily_cost_usd`) on top of the flag.
+- **Never** asked to do arithmetic — it only reasons qualitatively over
+  already-computed numbers (all math stays in Python / the ML models).
+
+```bash
+python scripts/run_judge.py        # only runs if the flag is on; respects cost cap
+python scripts/evaluate_judges.py  # hypothetical P&L, hit rate, consistency
+```
+
+In Docker, use the dedicated wrapper (its own once-daily crontab line, separate
+from the free twice-daily `run_daily_docker.sh`):
+
+```bash
+scripts/run_judge_docker.sh
+```
+
+Verdicts appear in the dashboard's **LLM Judges** tab (hypothetical equity,
+cumulative cost, hit rate, same-day consistency) — kept fully separate from the
+ML model leaderboards.
+

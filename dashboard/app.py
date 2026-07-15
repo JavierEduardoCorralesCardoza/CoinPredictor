@@ -27,7 +27,16 @@ import streamlit as st  # noqa: E402
 from plotly.subplots import make_subplots  # noqa: E402
 
 from coinpredictor.backtest import walk_forward_backtest  # noqa: E402
-from coinpredictor.config import MODEL  # noqa: E402
+from coinpredictor.config import (  # noqa: E402
+    ENTRY_LOG,
+    JUDGE,
+    JUDGE_LOG,
+    MODEL,
+    RISK_POLICY_RESULTS,
+    SENTIMENT_LOG,
+    TREND_REGIME_LOG,
+    VOLATILITY_LOG,
+)
 from coinpredictor.data.ohlcv import load_ohlcv  # noqa: E402
 from coinpredictor.features import build_default_features  # noqa: E402
 from coinpredictor.model import (  # noqa: E402
@@ -40,7 +49,8 @@ from coinpredictor.predict import predict_next_day  # noqa: E402
 
 st.set_page_config(page_title="CoinPredictor — BTC Volatility", layout="wide")
 
-_PREDICTION_LOG = _ROOT / "data" / "processed" / "prediction_log.csv"
+# Per-family prediction logs (Phase 1: one csv per family/target_type).
+_PREDICTION_LOG = VOLATILITY_LOG  # kept for the volatility track record
 
 
 # --- Cached data/model helpers ----------------------------------------------
@@ -55,18 +65,24 @@ def _get_backtest(_feats_key: str, feats: pd.DataFrame):
 
 
 @st.cache_data(show_spinner="Loading prediction log…", ttl=300)
-def _get_prediction_log(_mtime: float) -> pd.DataFrame:
-    """Load the real daily prediction log (long format: one row per day per
-    model). _mtime busts the cache when the CSV changes on disk (cron run)."""
-    df = pd.read_csv(
-        _PREDICTION_LOG,
-        parse_dates=["run_at", "as_of_date", "target_date"],
+def _get_prediction_log(_mtime: float, path_str: str) -> pd.DataFrame:
+    """Load a per-family prediction log. _mtime busts the cache when the CSV
+    changes on disk (cron run). path_str keys the cache per family file."""
+    df = pd.read_csv(path_str)
+    for col in ("as_of_date", "target_date", "run_at"):
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce")
+    numeric = (
+        "predicted_vol", "actual_vol", "abs_error", "trailing_vol",
+        "trend_regime_proba", "entry_proba", "entry_actual",
+        "sentiment_score", "sentiment_fwd_return", "sentiment_fwd_vol",
     )
-    for col in ("predicted_vol", "actual_vol", "abs_error", "trailing_vol"):
+    for col in numeric:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
-    if "regime_correct" in df.columns:
-        df["regime_correct"] = df["regime_correct"].astype(str) == "True"
+    for col in ("regime_correct", "trend_regime_correct", "entry_correct"):
+        if col in df.columns:
+            df[col] = df[col].astype(str) == "True"
     return df
 
 
@@ -124,8 +140,8 @@ c4.metric(
 st.divider()
 
 # --- Tabs --------------------------------------------------------------------
-tab_chart, tab_backtest, tab_importance, tab_track = st.tabs(
-    ["📈 Charts", "🧪 Backtest", "🔍 Explainability", "📊 Track Record"]
+tab_chart, tab_backtest, tab_importance, tab_track, tab_judges = st.tabs(
+    ["📈 Charts", "🧪 Backtest", "🔍 Explainability", "📊 Track Record", "⚖️ LLM Judges"]
 )
 
 with tab_chart:
@@ -217,137 +233,308 @@ with tab_importance:
         st.plotly_chart(fig_imp, use_container_width=True)
 
 with tab_track:
-    if not _PREDICTION_LOG.exists():
-        st.info(
-            "No predictions logged yet. The daily cron job will populate "
-            "data/processed/prediction_log.csv on its next run."
-        )
-    else:
-        log_mtime = _PREDICTION_LOG.stat().st_mtime
-        log_df = _get_prediction_log(log_mtime)
+    st.caption(
+        "Each model family logs to its OWN file and is scored on its OWN metric. "
+        "Every family shows its free/naive baseline for comparison."
+    )
 
-        if "model_name" not in log_df.columns:
-            st.warning(
-                "This log predates the multi-model registry. Run "
-                "scripts/migrate_add_model_name.py to upgrade it."
+    def _family_log(path):
+        if not path.exists():
+            return None
+        return _get_prediction_log(path.stat().st_mtime, str(path))
+
+    # --- Volatility ----------------------------------------------------------
+    st.subheader("📉 Volatility — MAE / RMSE / vol-regime accuracy")
+    vol_df = _family_log(VOLATILITY_LOG)
+    if vol_df is None or vol_df.empty:
+        st.info("No volatility predictions logged yet.")
+    else:
+        ev = vol_df[vol_df["status"] == "evaluated"]
+        if ev.empty:
+            st.info("No evaluated volatility predictions yet.")
+        else:
+            rows = []
+            for name, grp in ev.groupby("model_name"):
+                rows.append({
+                    "Model": name,
+                    "Evaluated": len(grp),
+                    "MAE": grp["abs_error"].mean(),
+                    "RMSE": (grp["abs_error"] ** 2).mean() ** 0.5,
+                    "Vol-regime acc": grp["regime_correct"].mean(),
+                })
+            board = pd.DataFrame(rows).sort_values("MAE")
+            st.dataframe(
+                board.style.format(
+                    {"MAE": "{:.2%}", "RMSE": "{:.2%}", "Vol-regime acc": "{:.0%}"}
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.caption(
+                "Baseline `naive_persistence_v1` (tomorrow = today) is the bar "
+                "every model should clear. Lower MAE/RMSE is better."
+            )
+
+            fig_v = go.Figure()
+            colors = ["#2196f3", "#ff9800", "#4caf50", "#e91e63", "#9c27b0"]
+            for idx, (name, grp) in enumerate(ev.groupby("model_name")):
+                grp = grp.sort_values("as_of_date")
+                c = colors[idx % len(colors)]
+                fig_v.add_trace(go.Scatter(
+                    x=grp["as_of_date"], y=grp["predicted_vol"],
+                    name=f"{name} — pred", line=dict(color=c)))
+                fig_v.add_trace(go.Scatter(
+                    x=grp["as_of_date"], y=grp["actual_vol"],
+                    name=f"{name} — actual", line=dict(color=c, dash="dot")))
+            fig_v.update_layout(height=360, yaxis_tickformat=".0%",
+                                title="Predicted vs realized volatility")
+            st.plotly_chart(fig_v, use_container_width=True)
+
+    st.divider()
+
+    # --- Trend regime --------------------------------------------------------
+    st.subheader("🧭 Trend regime — accuracy + per-class F1 (ALCISTA/BAJISTA/LATERAL)")
+    trend_df = _family_log(TREND_REGIME_LOG)
+    if trend_df is None or trend_df.empty:
+        st.info("No trend-regime predictions logged yet.")
+    else:
+        ev = trend_df[trend_df["status"] == "evaluated"]
+        if ev.empty:
+            st.info("No evaluated trend-regime predictions yet.")
+        else:
+            from sklearn.metrics import f1_score
+
+            labels = ["ALCISTA", "BAJISTA", "LATERAL"]
+            rows = []
+            for name, grp in ev.groupby("model_name"):
+                y_true = grp["trend_regime_actual"].astype(str)
+                y_pred = grp["trend_regime_pred"].astype(str)
+                f1s = f1_score(y_true, y_pred, labels=labels, average=None, zero_division=0)
+                rows.append({
+                    "Model": name,
+                    "Evaluated": len(grp),
+                    "Accuracy": (y_true == y_pred).mean(),
+                    "F1 ALCISTA": f1s[0],
+                    "F1 BAJISTA": f1s[1],
+                    "F1 LATERAL": f1s[2],
+                })
+            board = pd.DataFrame(rows).sort_values("Accuracy", ascending=False)
+            st.dataframe(
+                board.style.format({
+                    "Accuracy": "{:.0%}", "F1 ALCISTA": "{:.2f}",
+                    "F1 BAJISTA": "{:.2f}", "F1 LATERAL": "{:.2f}",
+                }),
+                use_container_width=True, hide_index=True,
+            )
+            st.caption("Baseline: `sma_cross_trend_v1` (rule-based, zero training).")
+
+    st.divider()
+
+    # --- Entry ---------------------------------------------------------------
+    st.subheader("🎯 Entry — precision / recall / calibration (triple-barrier)")
+    entry_df = _family_log(ENTRY_LOG)
+    if entry_df is None or entry_df.empty:
+        st.info("No entry predictions logged yet.")
+    else:
+        ev = entry_df[entry_df["status"] == "evaluated"]
+        if ev.empty:
+            st.info("No evaluated entry predictions yet.")
+        else:
+            rows = []
+            for name, grp in ev.groupby("model_name"):
+                y_true = grp["entry_actual"].astype(float)
+                pred = (grp["entry_proba"] >= 0.5).astype(int)
+                tp = int(((pred == 1) & (y_true == 1)).sum())
+                fp = int(((pred == 1) & (y_true == 0)).sum())
+                fn = int(((pred == 0) & (y_true == 1)).sum())
+                precision = tp / (tp + fp) if (tp + fp) else float("nan")
+                recall = tp / (tp + fn) if (tp + fn) else float("nan")
+                rows.append({
+                    "Model": name,
+                    "Evaluated": len(grp),
+                    "Precision": precision,
+                    "Recall": recall,
+                    "Base win-rate": y_true.mean(),
+                })
+            board = pd.DataFrame(rows).sort_values("Precision", ascending=False)
+            st.dataframe(
+                board.style.format({
+                    "Precision": "{:.2f}", "Recall": "{:.2f}", "Base win-rate": "{:.0%}",
+                }),
+                use_container_width=True, hide_index=True,
+            )
+            st.caption(
+                "Baseline: `baseline_entry_v1` (flat 0.5). Calibration below: does "
+                "a predicted proba bin actually win at that rate?"
+            )
+            # Calibration for the primary entry model, if present.
+            prim = ev[ev["model_name"] == "lgbm_entry_v1"].copy()
+            if not prim.empty:
+                prim["bin"] = (prim["entry_proba"] * 5).round() / 5
+                calib = prim.groupby("bin").agg(
+                    predicted=("entry_proba", "mean"),
+                    actual=("entry_actual", lambda s: s.astype(float).mean()),
+                    n=("entry_actual", "size"),
+                ).reset_index()
+                fig_c = go.Figure()
+                fig_c.add_trace(go.Scatter(x=[0, 1], y=[0, 1], name="Perfect",
+                                           line=dict(dash="dash", color="#888")))
+                fig_c.add_trace(go.Scatter(x=calib["predicted"], y=calib["actual"],
+                                           mode="markers+lines", name="lgbm_entry_v1"))
+                fig_c.update_layout(height=320, title="Entry calibration",
+                                    xaxis_title="Predicted win proba",
+                                    yaxis_title="Actual win rate")
+                st.plotly_chart(fig_c, use_container_width=True)
+
+    st.divider()
+
+    # --- Sentiment -----------------------------------------------------------
+    st.subheader("📰 Sentiment — corr(score, forward return)")
+    sent_df = _family_log(SENTIMENT_LOG)
+    if sent_df is None or sent_df.empty:
+        st.info("No sentiment predictions logged yet.")
+    else:
+        ev = sent_df[sent_df["status"] == "evaluated"]
+        if ev.empty:
+            st.info(
+                "No evaluated sentiment predictions yet (needs the forward "
+                "window to pass). There is no per-row 'correct' for sentiment."
             )
         else:
-            all_models = sorted(log_df["model_name"].unique())
-            evaluated_all = log_df[log_df["status"] == "evaluated"].copy()
-            pending_all = log_df[log_df["status"] == "pending"].copy()
-
+            rows = []
+            for name, grp in ev.groupby("model_name"):
+                score = grp["sentiment_score"]
+                fwd = grp["sentiment_fwd_return"]
+                valid = score.notna() & fwd.notna()
+                if valid.sum() >= 2 and score[valid].nunique() > 1:
+                    corr = float(score[valid].corr(fwd[valid]))
+                else:
+                    corr = float("nan")
+                rows.append({
+                    "Model": name, "Evaluated": len(grp),
+                    "corr(score, fwd_return)": corr,
+                })
+            board = pd.DataFrame(rows).sort_values(
+                "corr(score, fwd_return)", ascending=False)
+            st.dataframe(
+                board.style.format({"corr(score, fwd_return)": "{:.3f}"}),
+                use_container_width=True, hide_index=True,
+            )
             st.caption(
-                f"{len(log_df)} predictions logged across {len(all_models)} model(s) — "
-                f"{len(evaluated_all)} evaluated, {len(pending_all)} still pending."
+                "Baseline: `lexicon_sentiment_v1` (keyword lexicon, deterministic). "
+                "Correlation, not accuracy — sentiment has no realized label."
             )
 
-            # --- Leaderboard: one row per model, side by side -------------------
-            st.subheader("🏆 Model leaderboard")
-            if evaluated_all.empty:
-                st.info(
-                    "No evaluated predictions yet for any model. Each prediction "
-                    "needs its target_date to pass before it can be scored."
-                )
-            else:
-                rows = []
-                for name, grp in evaluated_all.groupby("model_name"):
-                    mae = grp["abs_error"].mean()
-                    rmse = (grp["abs_error"] ** 2).mean() ** 0.5
-                    acc = grp["regime_correct"].mean()
-                    rows.append(
-                        {
-                            "Model": name,
-                            "Evaluated": len(grp),
-                            "MAE": mae,
-                            "RMSE": rmse,
-                            "Regime accuracy": acc,
-                        }
-                    )
-                board = pd.DataFrame(rows).sort_values("MAE")
-                st.dataframe(
-                    board.style.format(
-                        {"MAE": "{:.2%}", "RMSE": "{:.2%}", "Regime accuracy": "{:.0%}"}
-                    ),
-                    use_container_width=True,
-                    hide_index=True,
-                )
-                st.caption(
-                    "Lower MAE/RMSE is better. `naive_persistence_v1` (predicts "
-                    "tomorrow = today) is the bar every other model should clear — "
-                    "if a fancier model doesn't beat it, it isn't earning its "
-                    "complexity."
-                )
+    st.divider()
 
-            st.divider()
+    # --- Risk policies -------------------------------------------------------
+    st.subheader("⚖️ Risk policies — Sharpe / max DD / Calmar / total return")
+    if not RISK_POLICY_RESULTS.exists():
+        st.info(
+            "No risk-policy results yet. Run scripts/evaluate_risk_policies.py "
+            "to backtest the position-sizing policies."
+        )
+    else:
+        risk_df = pd.read_csv(RISK_POLICY_RESULTS)
+        st.dataframe(
+            risk_df.sort_values("sharpe", ascending=False).style.format({
+                "sharpe": "{:.2f}", "max_drawdown": "{:.1%}",
+                "calmar": "{:.2f}", "total_return": "{:.1%}",
+            }),
+            use_container_width=True, hide_index=True,
+        )
+        st.caption(
+            "Baseline: `buy_and_hold` (FixedWeightPolicy 100%). A sizing policy "
+            "earns its keep only by beating it on risk-adjusted return."
+        )
 
-            # --- Model selector for detail charts --------------------------------
-            selected = st.multiselect(
-                "Compare models in the charts below",
-                options=all_models,
-                default=all_models,
-            )
-            evaluated = evaluated_all[evaluated_all["model_name"].isin(selected)]
 
-            if evaluated.empty:
-                st.info("No evaluated predictions yet for the selected model(s).")
-            else:
-                fig_track = go.Figure()
-                colors = [
-                    "#2196f3", "#ff9800", "#4caf50", "#e91e63", "#9c27b0", "#795548",
-                ]
-                for idx, (name, grp) in enumerate(evaluated.groupby("model_name")):
+with tab_judges:
+    st.subheader("⚖️ LLM Judges — decision-quality layer (separate from ML models)")
+    st.caption(
+        "Non-deterministic agents that read each family's primary model output "
+        "and emit a BUY/HOLD/SELL verdict. Judged on hypothetical P&L, hit rate, "
+        "cost and consistency — NEVER on MAE/accuracy. Observation only; no "
+        "orders are ever placed."
+    )
+
+    if not JUDGE.enabled:
+        st.info(
+            "🟢 Judge layer is DISABLED by default (COINPREDICTOR_JUDGE_ENABLED="
+            "false) — it makes zero API calls. Enable the flag and run "
+            "scripts/run_judge.py to start logging verdicts."
+        )
+
+    if not JUDGE_LOG.exists():
+        st.info("No judge verdicts logged yet. This tab populates once "
+                "scripts/run_judge.py runs with the flag on.")
+    else:
+        jdf = pd.read_csv(JUDGE_LOG)
+        if jdf.empty:
+            st.info("Judge log is empty.")
+        else:
+            for col in ("as_of_date", "target_date", "run_at"):
+                if col in jdf.columns:
+                    jdf[col] = pd.to_datetime(jdf[col], errors="coerce")
+            for col in ("confidence", "suggested_weight", "estimated_cost_usd",
+                        "hypothetical_pnl", "realized_fwd_return"):
+                if col in jdf.columns:
+                    jdf[col] = pd.to_numeric(jdf[col], errors="coerce")
+
+            total_cost = jdf["estimated_cost_usd"].fillna(0).sum()
+            evaluated = jdf[jdf["status"] == "evaluated"].copy()
+
+            k1, k2, k3 = st.columns(3)
+            k1.metric("Verdicts logged", len(jdf))
+            k2.metric("Evaluated", len(evaluated))
+            k3.metric("Cumulative est. cost", f"${total_cost:,.4f}")
+
+            # Hypothetical equity curve (reuse the Backtest chart style).
+            if not evaluated.empty:
+                for name, grp in evaluated.groupby("model_name"):
                     grp = grp.sort_values("as_of_date")
-                    color = colors[idx % len(colors)]
-                    fig_track.add_trace(
-                        go.Scatter(
-                            x=grp["as_of_date"], y=grp["predicted_vol"],
-                            name=f"{name} — predicted", mode="lines+markers",
-                            line=dict(color=color),
-                        )
-                    )
-                    fig_track.add_trace(
-                        go.Scatter(
-                            x=grp["as_of_date"], y=grp["actual_vol"],
-                            name=f"{name} — actual", mode="lines+markers",
-                            line=dict(color=color, dash="dot"),
-                        )
-                    )
-                fig_track.update_layout(
-                    height=440,
-                    title="Predicted vs. realized volatility, by model",
-                    yaxis_title="Annualized volatility",
-                    yaxis_tickformat=".0%",
-                )
-                st.plotly_chart(fig_track, use_container_width=True)
+                    grp = grp.dropna(subset=["hypothetical_pnl"])
+                    if grp.empty:
+                        continue
+                    equity = (1.0 + grp["hypothetical_pnl"]).cumprod()
+                    fig_j = go.Figure()
+                    fig_j.add_trace(go.Scatter(
+                        x=grp["as_of_date"], y=equity, name=f"{name} (hypothetical)"))
+                    fig_j.update_layout(
+                        height=360,
+                        title=f"Hypothetical equity — {name} (growth of $1)",
+                        yaxis_title="Equity")
+                    st.plotly_chart(fig_j, use_container_width=True)
 
-                fig_mae = go.Figure()
-                for idx, (name, grp) in enumerate(evaluated.groupby("model_name")):
-                    grp = grp.sort_values("as_of_date").copy()
-                    grp["cumulative_mae"] = grp["abs_error"].expanding().mean()
-                    fig_mae.add_trace(
-                        go.Scatter(
-                            x=grp["as_of_date"], y=grp["cumulative_mae"],
-                            name=name, line=dict(color=colors[idx % len(colors)]),
-                        )
-                    )
-                fig_mae.update_layout(
-                    height=320,
-                    title="Cumulative MAE over time, by model",
-                    yaxis_title="Mean absolute error",
-                )
-                st.plotly_chart(fig_mae, use_container_width=True)
-
-            with st.expander("📋 Full prediction log (all models)", expanded=evaluated_all.empty):
-                display_cols = [
-                    c
-                    for c in [
-                        "as_of_date", "model_name", "target_type", "target_date", "status",
-                        "predicted_vol", "actual_vol", "regime_pred", "actual_regime",
-                        "regime_correct", "abs_error",
-                    ]
-                    if c in log_df.columns
-                ]
+                # Consistency: % agreement on action across same-day repeats.
+                rows = []
+                for name, grp in jdf.groupby("model_name"):
+                    shares = []
+                    for _d, g in grp.groupby("as_of_date"):
+                        if len(g) > 1:
+                            shares.append(g["action"].value_counts(normalize=True).iloc[0])
+                    hit = (evaluated[evaluated["model_name"] == name]["hypothetical_pnl"] > 0).mean() \
+                        if not evaluated.empty else float("nan")
+                    rows.append({
+                        "Judge": name,
+                        "Verdicts": len(grp),
+                        "Hit rate": hit,
+                        "Consistency (same-day)": (sum(shares) / len(shares)) if shares else float("nan"),
+                    })
                 st.dataframe(
-                    log_df[display_cols].sort_values("as_of_date", ascending=False),
-                    use_container_width=True,
+                    pd.DataFrame(rows).style.format(
+                        {"Hit rate": "{:.0%}", "Consistency (same-day)": "{:.0%}"}),
+                    use_container_width=True, hide_index=True,
                 )
+
+            with st.expander("📋 Verdict history", expanded=evaluated.empty):
+                show = [c for c in [
+                    "run_at", "model_name", "as_of_date", "action", "confidence",
+                    "suggested_weight", "estimated_cost_usd", "realized_fwd_return",
+                    "hypothetical_pnl", "status", "reasoning",
+                ] if c in jdf.columns]
+                st.dataframe(
+                    jdf[show].sort_values("run_at", ascending=False),
+                    use_container_width=True, hide_index=True,
+                )
+

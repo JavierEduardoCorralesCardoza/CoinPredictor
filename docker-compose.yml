@@ -6,6 +6,11 @@ services:
     image: coinpredictor:latest
     command: ["streamlit", "run", "dashboard/app.py",
               "--server.port=8501", "--server.address=0.0.0.0"]
+    # Optional: pass runtime flags/keys (paid-capability toggles, ANTHROPIC_API_KEY)
+    # without rebuilding. Won't fail if .env is absent (all flags default off).
+    env_file:
+      - path: .env
+        required: false
     volumes:
       - ./data:/app/data
       - ./models:/app/models
@@ -19,6 +24,11 @@ services:
     build: .
     image: coinpredictor:latest
     profiles: ["cli"]
+    # Optional runtime env (judge/sentiment flags + ANTHROPIC_API_KEY). Won't
+    # fail if .env is absent; every paid capability defaults to off.
+    env_file:
+      - path: .env
+        required: false
     volumes:
       - ./data:/app/data
       - ./models:/app/models

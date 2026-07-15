@@ -15,6 +15,7 @@ drawdowns* versus passively holding the asset.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Protocol
 
 import numpy as np
 import pandas as pd
@@ -277,6 +278,203 @@ def compare_strategies(features_df: pd.DataFrame, n_splits: int | None = None) -
             f"Sharpe {res.strategy_sharpe:.2f}  maxDD {res.strategy_max_drawdown:7.2%}"
         )
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Risk family (Phase 1d): pluggable position-sizing policies.
+#
+# Unlike the other families, ``risk`` is NOT a per-day prediction row. A policy
+# is a *rule* mapping today's forecasts to a BTC weight; it is evaluated by
+# replaying it over history and looking at portfolio-level outcomes (Sharpe,
+# max drawdown, Calmar, total return). One row per policy lands in
+# risk_policy_results.csv via scripts/evaluate_risk_policies.py.
+# ---------------------------------------------------------------------------
+class RiskPolicy(Protocol):
+    """A position-sizing rule: forecasts in, a BTC weight in [0, 1] out."""
+
+    name: str
+
+    def size(
+        self,
+        predicted_vol: float,
+        regime_proba: float | None,
+        trend_regime: str | None,
+    ) -> float:
+        ...
+
+
+@dataclass
+class FixedWeightPolicy:
+    """Always hold a fixed weight. At 100% this IS the buy-and-hold benchmark
+    (the required baseline for this family) — reused explicitly, not reinvented.
+    """
+
+    name: str = "fixed_full_weight"
+    weight: float = 1.0
+
+    def size(self, predicted_vol, regime_proba=None, trend_regime=None) -> float:
+        return float(min(max(self.weight, STRATEGY.min_weight), STRATEGY.max_weight))
+
+
+@dataclass
+class VolTargetPolicy:
+    """The existing volatility-targeting logic, refactored into the interface.
+
+    Scales exposure inversely to forecast vol (``power``) and optionally trims
+    it when the high-vol regime is likely (``regime_cut``) — identical math to
+    ``recommend_weight`` so live advice and this backtest stay consistent.
+    """
+
+    name: str = "vol_target"
+    power: float = 1.0
+    regime_cut: float = 0.0
+
+    def size(self, predicted_vol, regime_proba=None, trend_regime=None) -> float:
+        if predicted_vol is None or predicted_vol <= 0:
+            return STRATEGY.min_weight
+        raw = (STRATEGY.target_annual_vol / predicted_vol) ** self.power
+        weight = min(max(raw, STRATEGY.min_weight), STRATEGY.max_weight)
+        if regime_proba is not None and self.regime_cut > 0.0:
+            weight *= 1.0 - self.regime_cut * min(max(regime_proba, 0.0), 1.0)
+            weight = min(max(weight, STRATEGY.min_weight), STRATEGY.max_weight)
+        return float(weight)
+
+
+@dataclass
+class KellyFractionPolicy:
+    """Fractional-Kelly sizing under a constant-Sharpe assumption.
+
+    Kelly-optimal leverage for a lognormal asset is ``mu/sigma^2 = Sharpe/sigma``.
+    We don't forecast ``mu`` per day, so we assume a modest constant Sharpe and
+    take a fraction of full Kelly (full Kelly is famously too aggressive), then
+    scale the position inversely to the *forecast* volatility.
+    """
+
+    name: str = "kelly_fraction"
+    assumed_sharpe: float = 0.5
+    kelly_fraction: float = 0.5
+
+    def size(self, predicted_vol, regime_proba=None, trend_regime=None) -> float:
+        if predicted_vol is None or predicted_vol <= 0:
+            return STRATEGY.min_weight
+        weight = self.kelly_fraction * self.assumed_sharpe / predicted_vol
+        return float(min(max(weight, STRATEGY.min_weight), STRATEGY.max_weight))
+
+
+def _calmar(total_return: float, n_days: int, max_drawdown: float) -> float:
+    """Annualized-return / |max drawdown|. 0 if drawdown is ~0 or no history."""
+    if n_days <= 0 or max_drawdown >= -1e-9:
+        return 0.0
+    annualized = (1.0 + total_return) ** (365.0 / n_days) - 1.0
+    return float(annualized / abs(max_drawdown))
+
+
+def _walk_forward_vol_preds(
+    features_df: pd.DataFrame, n_splits: int | None = None
+) -> tuple[pd.Series, pd.Series]:
+    """Out-of-sample forecast vol + high-vol-regime probability, per row."""
+    from sklearn.model_selection import TimeSeriesSplit
+
+    from coinpredictor.model import build_regime_classifier, build_vol_regressor
+
+    n_splits = n_splits or MODEL.n_splits
+    cols = feature_columns(features_df)
+    X = features_df[cols]
+    y = features_df[MODEL.target_col].astype(float)
+    y_regime = features_df[MODEL.regime_col].astype(int)
+
+    preds = pd.Series(index=features_df.index, dtype="float64")
+    regime = pd.Series(index=features_df.index, dtype="float64")
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+    for train_idx, test_idx in tscv.split(X):
+        reg = build_vol_regressor()
+        reg.fit(X.iloc[train_idx], y.iloc[train_idx])
+        preds.iloc[test_idx] = reg.predict(X.iloc[test_idx])
+        clf = build_regime_classifier()
+        clf.fit(X.iloc[train_idx], y_regime.iloc[train_idx])
+        regime.iloc[test_idx] = clf.predict_proba(X.iloc[test_idx])[:, 1]
+    return preds, regime
+
+
+def backtest_policy(
+    policy: RiskPolicy,
+    features_df: pd.DataFrame,
+    predicted_vol: pd.Series,
+    regime_proba: pd.Series | None = None,
+    trend_regime: pd.Series | None = None,
+    fee: float = 0.001,
+) -> dict:
+    """Replay a sizing policy over pre-computed OOS forecasts; return metrics."""
+    df = features_df.copy()
+    df["pred_vol"] = predicted_vol.reindex(df.index)
+    df["next_return"] = df["close"].shift(-1) / df["close"] - 1.0
+    df = df.dropna(subset=["next_return", "pred_vol"])
+
+    weights = []
+    for idx in df.index:
+        rp = (
+            float(regime_proba[idx])
+            if regime_proba is not None and idx in regime_proba.index
+            else None
+        )
+        tr = (
+            trend_regime[idx]
+            if trend_regime is not None and idx in trend_regime.index
+            else None
+        )
+        weights.append(policy.size(float(df.loc[idx, "pred_vol"]), rp, tr))
+    weight = pd.Series(weights, index=df.index).clip(
+        STRATEGY.min_weight, STRATEGY.max_weight
+    )
+
+    turnover = weight.diff().abs().fillna(weight.abs())
+    strat_returns = weight * df["next_return"] - turnover * fee
+    equity = (1.0 + strat_returns).cumprod()
+
+    total_return = float(equity.iloc[-1] - 1.0) if len(equity) else 0.0
+    max_dd = _max_drawdown(equity) if len(equity) else 0.0
+    return {
+        "policy": policy.name,
+        "sharpe": _annualized_sharpe(strat_returns),
+        "max_drawdown": max_dd,
+        "calmar": _calmar(total_return, len(equity), max_dd),
+        "total_return": total_return,
+        "n_days": int(len(equity)),
+    }
+
+
+def evaluate_risk_policies(
+    features_df: pd.DataFrame,
+    policies: list[RiskPolicy],
+    n_splits: int | None = None,
+    trend_regime: pd.Series | None = None,
+) -> list[dict]:
+    """Run every policy through walk-forward OOS forecasts and score each."""
+    preds, regime = _walk_forward_vol_preds(features_df, n_splits=n_splits)
+    mask = preds.notna()
+    fdf = features_df[mask]
+    results = []
+    for policy in policies:
+        results.append(
+            backtest_policy(
+                policy,
+                fdf,
+                preds[mask],
+                regime_proba=regime[mask],
+                trend_regime=trend_regime,
+            )
+        )
+    return results
+
+
+# Default policy roster evaluated by scripts/evaluate_risk_policies.py. The
+# FixedWeightPolicy(1.0) baseline (buy & hold) is listed first, on purpose.
+RISK_POLICIES: list[RiskPolicy] = [
+    FixedWeightPolicy(name="buy_and_hold", weight=1.0),
+    VolTargetPolicy(name="vol_target_p1", power=1.0),
+    VolTargetPolicy(name="vol_target_regime", power=1.0, regime_cut=0.5),
+    KellyFractionPolicy(name="kelly_half", assumed_sharpe=0.5, kelly_fraction=0.5),
+]
 
 
 if __name__ == "__main__":  # pragma: no cover - manual run

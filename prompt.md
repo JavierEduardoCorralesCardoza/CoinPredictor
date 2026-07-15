@@ -1,13 +1,4 @@
 # CoinPredictor — Hierarchical Multi-Model Architecture + LLM Judge Layer
-
-## HOW TO USE THIS PROMPT
-Paste this entire document as the first message in a GitHub Copilot agent
-session (Opus 4.8) with the CoinPredictor repo open. Work through the phases
-IN ORDER. Stop after each phase for human review before starting the next —
-do not implement Phase 2 or 3 in the same session unless explicitly told to
-continue. If anything in "Section 0" contradicts what you find in the repo,
-trust the repo and note the deviation in a comment rather than guessing.
-
 ---
 
 ## 0. CONTEXT: WHAT ALREADY EXISTS (read this, then verify against the repo)

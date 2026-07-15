@@ -12,7 +12,21 @@ WORKDIR /app
 # Install deps first so code changes don't bust the layer cache.
 COPY pyproject.toml requirements.txt ./
 COPY src ./src
-RUN pip install --no-cache-dir --upgrade pip && pip install --no-cache-dir -e .
+# CPU-only torch (much smaller than the default CUDA build) is installed
+# explicitly before the rest so FinBERT (transformers) can run locally without
+# a GPU. Keeps the image lean while still supporting the free Tier-2 sentiment.
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu \
+    && pip install --no-cache-dir -e .
+
+# Pre-download FinBERT into the image so the daily job never fetches it at run
+# time. HF_HOME points at a path that is NOT bind-mounted, so the cached weights
+# survive in the image layer. First-run download is ~440 MB; the resulting image
+# grows by roughly 0.5 GB (weights) + torch. Set to a lighter tier if disk is
+# tight by not registering FinBERTSentimentAdapter in registry.MODELS.
+ENV HF_HOME=/app/.cache/huggingface
+RUN python -c "from transformers import pipeline; pipeline('text-classification', model='ProsusAI/finbert', top_k=None)" \
+    || echo "WARN: FinBERT pre-download failed at build time; it will download on first use."
 
 COPY . .
 

@@ -24,6 +24,36 @@ for _d in (RAW_DIR, PROCESSED_DIR, MODELS_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
 
+# --- Per-family prediction log files -----------------------------------------
+# One CSV per model family (see prompt Section 3). Each family has a genuinely
+# different row shape, so cramming them into one wide table with a target_type
+# discriminator leaves most columns empty most of the time. The filename encodes
+# the target_type; registry.LOG_FILE_BY_TARGET_TYPE maps adapters -> file.
+VOLATILITY_LOG = PROCESSED_DIR / "volatility_log.csv"
+TREND_REGIME_LOG = PROCESSED_DIR / "trend_regime_log.csv"
+ENTRY_LOG = PROCESSED_DIR / "entry_log.csv"
+SENTIMENT_LOG = PROCESSED_DIR / "sentiment_log.csv"
+RISK_POLICY_RESULTS = PROCESSED_DIR / "risk_policy_results.csv"
+JUDGE_LOG = PROCESSED_DIR / "judge_log.csv"
+
+
+# --- Cost discipline: one dedicated flag PER paid capability ------------------
+# Section 2 of the prompt: everything must run at zero cost by default. Each
+# capability that costs real money ships DISABLED behind its OWN boolean flag
+# (never one master switch), so the user can turn on exactly one paid thing.
+def _env_bool(name: str, default: bool = False) -> bool:
+    """Parse a boolean environment variable ("1"/"true"/"yes"/"on" => True)."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+PAID_NEWS_ENABLED = _env_bool("COINPREDICTOR_PAID_NEWS", False)      # Phase 2
+LLM_SENTIMENT_ENABLED = _env_bool("COINPREDICTOR_LLM_SENTIMENT", False)  # Phase 2
+JUDGE_ENABLED = _env_bool("COINPREDICTOR_JUDGE_ENABLED", False)     # Phase 3
+
+
 # --- Data parameters ---------------------------------------------------------
 @dataclass(frozen=True)
 class DataConfig:
@@ -127,8 +157,86 @@ class FeatureConfig:
 # --- API keys (optional, Phase 3) -------------------------------------------
 NEWSAPI_KEY = os.getenv("NEWSAPI_KEY", "")
 CRYPTOPANIC_KEY = os.getenv("CRYPTOPANIC_KEY", "")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+
+
+# --- Trend-regime family (Phase 1b) -----------------------------------------
+@dataclass(frozen=True)
+class TrendConfig:
+    """Trend-regime classifier settings (ALCISTA / BAJISTA / LATERAL).
+
+    NOTE: this is a DIFFERENT concept from the volatility regime (ELEVATED /
+    CALM). Never reuse the ``regime_pred`` column here -- this family owns
+    ``trend_regime_pred`` in its own ``trend_regime_log.csv``.
+    """
+
+    # Forward horizon (days) over which the trend label is measured. Kept equal
+    # to the volatility horizon so all families score on the same target_date.
+    horizon: int = 5
+
+    # The LATERAL band is defined dynamically as ``band_vol_mult`` times the
+    # trailing daily volatility scaled to the horizon, rather than a fixed % --
+    # a static "+/-3%" band would call every move ALCISTA in a calm regime and
+    # every move LATERAL in a turbulent one. Scaling by realized vol keeps the
+    # three classes roughly balanced across regimes.
+    band_vol_mult: float = 1.0
+
+    model_filename: str = "btc_trend_lgbm.pkl"
+
+
+# --- Entry family (Phase 1c) -------------------------------------------------
+@dataclass(frozen=True)
+class EntryConfig:
+    """Triple-barrier entry classifier settings.
+
+    A long entry taken today is labelled 1 if price touches the take-profit
+    barrier before the stop-loss barrier (or timeout) using daily High/Low.
+    """
+
+    horizon: int = 10          # max holding period (time barrier), trading days
+    tp_pct: float = 0.05       # take-profit barrier: +5% from entry close
+    sl_pct: float = 0.05       # stop-loss barrier: -5% from entry close
+    model_filename: str = "btc_entry_lgbm.pkl"
+
+
+# --- Sentiment models (Phase 1e / Phase 2) ----------------------------------
+@dataclass(frozen=True)
+class SentimentConfig:
+    """Daily aggregate news-sentiment scoring settings (score in -1..+1)."""
+
+    horizon: int = 5                       # forward window for eval correlation
+    finbert_model: str = "ProsusAI/finbert"  # HF financial-sentiment BERT
+    llm_model: str = "claude-sonnet-4-20250514"  # paid tier (flag-gated)
+    max_headlines: int = 40                # cap headlines scored per day
+    finbert_cache_dir: str = str(MODELS_DIR / "finbert")
+
+
+# --- LLM Judge layer (Phase 3) ----------------------------------------------
+@dataclass(frozen=True)
+class JudgeConfig:
+    """LLM Judge layer settings. Disabled by default via JUDGE_ENABLED."""
+
+    enabled: bool = JUDGE_ENABLED
+    model: str = "claude-sonnet-4-20250514"
+    max_tokens: int = 1024
+    horizon: int = 5                       # forward window for hypothetical P&L
+
+    # Hard daily spend cap (on TOP of the master flag). run_judge.py checks the
+    # cumulative estimated_cost_usd already logged today and skips if over cap,
+    # mirroring the "refuse silently-stale-data" guard in ohlcv.py.
+    max_daily_cost_usd: float = 0.50
+
+    # Anthropic list prices (USD per million tokens). Used only to ESTIMATE and
+    # cap spend locally -- no arithmetic is ever delegated to the LLM itself.
+    input_cost_per_mtok: float = 3.0
+    output_cost_per_mtok: float = 15.0
+
 
 DATA = DataConfig()
 MODEL = ModelConfig()
 STRATEGY = StrategyConfig()
 FEATURES = FeatureConfig()
+TREND = TrendConfig()
+ENTRY = EntryConfig()
+SENTIMENT = SentimentConfig()
+JUDGE = JudgeConfig()
