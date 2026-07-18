@@ -207,7 +207,8 @@ with tab_importance:
 with tab_track:
     st.caption(
         "Each model family logs to its OWN file and is scored on its OWN metric. "
-        "Pick a model type below, then compare its models one table at a time."
+        "Pick a model type below to see every model's full history — pending "
+        "rows included — one table per model."
     )
 
     def _family_log(path):
@@ -230,47 +231,48 @@ with tab_track:
         if vol_df is None or vol_df.empty:
             st.info("No volatility predictions logged yet.")
         else:
-            ev = vol_df[vol_df["status"] == "evaluated"]
-            if ev.empty:
-                st.info("No evaluated volatility predictions yet.")
-            else:
-                for name, grp in ev.groupby("model_name"):
-                    grp = grp.sort_values("as_of_date")
-                    st.markdown(f"**{name}**")
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("Evaluated", len(grp))
-                    c2.metric("MAE", f"{grp['abs_error'].mean():.2%}")
-                    c3.metric(
-                        "Vol-regime acc",
-                        f"{grp['regime_correct'].mean():.0%}"
-                        if grp["regime_correct"].notna().any() else "n/a",
-                    )
-                    st.dataframe(
-                        grp[[
-                            "as_of_date", "predicted_vol", "actual_vol",
-                            "regime_pred", "actual_regime", "regime_correct",
-                            "abs_error",
-                        ]].style.format({
-                            "predicted_vol": "{:.2%}", "actual_vol": "{:.2%}",
-                            "abs_error": "{:.2%}",
-                        }),
-                        width="stretch", hide_index=True,
-                    )
+            for name, grp in vol_df.groupby("model_name"):
+                grp = grp.sort_values("as_of_date", ascending=False)
+                ev = grp[grp["status"] == "evaluated"]
+                st.markdown(f"**{name}**")
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Evaluated / total", f"{len(ev)} / {len(grp)}")
+                c2.metric("MAE", f"{ev['abs_error'].mean():.2%}" if not ev.empty else "n/a")
+                c3.metric(
+                    "Vol-regime acc",
+                    f"{ev['regime_correct'].mean():.0%}"
+                    if not ev.empty and ev["regime_correct"].notna().any() else "n/a",
+                )
+                st.dataframe(
+                    grp[[
+                        "as_of_date", "predicted_vol", "actual_vol",
+                        "regime_pred", "actual_regime", "regime_correct",
+                        "abs_error", "status",
+                    ]].style.format({
+                        "predicted_vol": "{:.2%}",
+                        "actual_vol": lambda v: f"{v:.2%}" if pd.notna(v) else "—",
+                        "abs_error": lambda v: f"{v:.2%}" if pd.notna(v) else "—",
+                    }),
+                    width="stretch", hide_index=True,
+                )
+                if not ev.empty:
                     fig_v = go.Figure()
+                    ev_sorted = ev.sort_values("as_of_date")
                     fig_v.add_trace(go.Scatter(
-                        x=grp["as_of_date"], y=grp["predicted_vol"], name="predicted"))
+                        x=ev_sorted["as_of_date"], y=ev_sorted["predicted_vol"], name="predicted"))
                     fig_v.add_trace(go.Scatter(
-                        x=grp["as_of_date"], y=grp["actual_vol"], name="actual",
+                        x=ev_sorted["as_of_date"], y=ev_sorted["actual_vol"], name="actual",
                         line=dict(dash="dot")))
                     fig_v.update_layout(
                         height=280, yaxis_tickformat=".0%",
                         title=f"{name} — predicted vs realized volatility")
                     st.plotly_chart(fig_v, width="stretch")
-                    st.divider()
-                st.caption(
-                    "Baseline `naive_persistence_v1` (tomorrow = today) is the bar "
-                    "every model should clear. Lower MAE/RMSE is better."
-                )
+                st.divider()
+            st.caption(
+                "Baseline `naive_persistence_v1` (tomorrow = today) is the bar "
+                "every model should clear. Lower MAE/RMSE is better. Rows with "
+                "'pending' status haven't reached their target_date yet."
+            )
 
     elif family == "trend_regime":
         st.subheader("🧭 Trend regime — accuracy + per-class F1 (ALCISTA/BAJISTA/LATERAL)")
@@ -278,33 +280,38 @@ with tab_track:
         if trend_df is None or trend_df.empty:
             st.info("No trend-regime predictions logged yet.")
         else:
-            ev = trend_df[trend_df["status"] == "evaluated"]
-            if ev.empty:
-                st.info("No evaluated trend-regime predictions yet.")
-            else:
-                from sklearn.metrics import f1_score
+            from sklearn.metrics import f1_score
 
-                labels = ["ALCISTA", "BAJISTA", "LATERAL"]
-                for name, grp in ev.groupby("model_name"):
-                    grp = grp.sort_values("as_of_date")
-                    y_true = grp["trend_regime_actual"].astype(str)
-                    y_pred = grp["trend_regime_pred"].astype(str)
+            labels = ["ALCISTA", "BAJISTA", "LATERAL"]
+            for name, grp in trend_df.groupby("model_name"):
+                grp = grp.sort_values("as_of_date", ascending=False)
+                ev = grp[grp["status"] == "evaluated"]
+                st.markdown(f"**{name}**")
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Evaluated / total", f"{len(ev)} / {len(grp)}")
+                if not ev.empty:
+                    y_true = ev["trend_regime_actual"].astype(str)
+                    y_pred = ev["trend_regime_pred"].astype(str)
                     f1s = f1_score(y_true, y_pred, labels=labels, average=None, zero_division=0)
-                    st.markdown(f"**{name}**")
-                    c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("Evaluated", len(grp))
                     c2.metric("Accuracy", f"{(y_true == y_pred).mean():.0%}")
                     c3.metric("F1 ALCISTA", f"{f1s[0]:.2f}")
                     c4.metric("F1 BAJISTA", f"{f1s[1]:.2f}")
-                    st.dataframe(
-                        grp[[
-                            "as_of_date", "trend_regime_pred", "trend_regime_proba",
-                            "trend_regime_actual", "trend_regime_correct",
-                        ]],
-                        width="stretch", hide_index=True,
-                    )
-                    st.divider()
-                st.caption("Baseline: `sma_cross_trend_v1` (rule-based, zero training).")
+                else:
+                    c2.metric("Accuracy", "n/a")
+                    c3.metric("F1 ALCISTA", "n/a")
+                    c4.metric("F1 BAJISTA", "n/a")
+                st.dataframe(
+                    grp[[
+                        "as_of_date", "trend_regime_pred", "trend_regime_proba",
+                        "trend_regime_actual", "trend_regime_correct", "status",
+                    ]],
+                    width="stretch", hide_index=True,
+                )
+                st.divider()
+            st.caption(
+                "Baseline: `sma_cross_trend_v1` (rule-based, zero training). "
+                "Rows with 'pending' status haven't reached their target_date yet."
+            )
 
     elif family == "entry":
         st.subheader("🎯 Entry — precision / recall / calibration (triple-barrier)")
@@ -312,51 +319,56 @@ with tab_track:
         if entry_df is None or entry_df.empty:
             st.info("No entry predictions logged yet.")
         else:
-            ev = entry_df[entry_df["status"] == "evaluated"]
-            if ev.empty:
-                st.info("No evaluated entry predictions yet.")
-            else:
-                for name, grp in ev.groupby("model_name"):
-                    grp = grp.sort_values("as_of_date")
-                    y_true = grp["entry_actual"].astype(float)
-                    pred = (grp["entry_proba"] >= 0.5).astype(int)
+            for name, grp in entry_df.groupby("model_name"):
+                grp = grp.sort_values("as_of_date", ascending=False)
+                ev = grp[grp["status"] == "evaluated"]
+                st.markdown(f"**{name}**")
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Evaluated / total", f"{len(ev)} / {len(grp)}")
+                if not ev.empty:
+                    y_true = ev["entry_actual"].astype(float)
+                    pred = (ev["entry_proba"] >= 0.5).astype(int)
                     tp = int(((pred == 1) & (y_true == 1)).sum())
                     fp = int(((pred == 1) & (y_true == 0)).sum())
                     fn = int(((pred == 0) & (y_true == 1)).sum())
                     precision = tp / (tp + fp) if (tp + fp) else float("nan")
                     recall = tp / (tp + fn) if (tp + fn) else float("nan")
-                    st.markdown(f"**{name}**")
-                    c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("Evaluated", len(grp))
                     c2.metric("Precision", f"{precision:.2f}" if precision == precision else "n/a")
                     c3.metric("Recall", f"{recall:.2f}" if recall == recall else "n/a")
                     c4.metric("Base win-rate", f"{y_true.mean():.0%}")
-                    st.dataframe(
-                        grp[[
-                            "as_of_date", "entry_proba", "tp_pct", "sl_pct",
-                            "entry_actual", "entry_correct",
-                        ]],
-                        width="stretch", hide_index=True,
-                    )
-                    if name == "lgbm_entry_v1":
-                        gg = grp.copy()
-                        gg["bin"] = (gg["entry_proba"] * 5).round() / 5
-                        calib = gg.groupby("bin").agg(
-                            predicted=("entry_proba", "mean"),
-                            actual=("entry_actual", lambda s: s.astype(float).mean()),
-                            n=("entry_actual", "size"),
-                        ).reset_index()
-                        fig_c = go.Figure()
-                        fig_c.add_trace(go.Scatter(x=[0, 1], y=[0, 1], name="Perfect",
-                                                   line=dict(dash="dash", color="#888")))
-                        fig_c.add_trace(go.Scatter(x=calib["predicted"], y=calib["actual"],
-                                                   mode="markers+lines", name=name))
-                        fig_c.update_layout(height=280, title=f"{name} — calibration",
-                                            xaxis_title="Predicted win proba",
-                                            yaxis_title="Actual win rate")
-                        st.plotly_chart(fig_c, width="stretch")
-                    st.divider()
-                st.caption("Baseline: `baseline_entry_v1` (flat 0.5).")
+                else:
+                    c2.metric("Precision", "n/a")
+                    c3.metric("Recall", "n/a")
+                    c4.metric("Base win-rate", "n/a")
+                st.dataframe(
+                    grp[[
+                        "as_of_date", "entry_proba", "tp_pct", "sl_pct",
+                        "entry_actual", "entry_correct", "status",
+                    ]],
+                    width="stretch", hide_index=True,
+                )
+                if name == "lgbm_entry_v1" and not ev.empty:
+                    gg = ev.copy()
+                    gg["bin"] = (gg["entry_proba"] * 5).round() / 5
+                    calib = gg.groupby("bin").agg(
+                        predicted=("entry_proba", "mean"),
+                        actual=("entry_actual", lambda s: s.astype(float).mean()),
+                        n=("entry_actual", "size"),
+                    ).reset_index()
+                    fig_c = go.Figure()
+                    fig_c.add_trace(go.Scatter(x=[0, 1], y=[0, 1], name="Perfect",
+                                               line=dict(dash="dash", color="#888")))
+                    fig_c.add_trace(go.Scatter(x=calib["predicted"], y=calib["actual"],
+                                               mode="markers+lines", name=name))
+                    fig_c.update_layout(height=280, title=f"{name} — calibration",
+                                        xaxis_title="Predicted win proba",
+                                        yaxis_title="Actual win rate")
+                    st.plotly_chart(fig_c, width="stretch")
+                st.divider()
+            st.caption(
+                "Baseline: `baseline_entry_v1` (flat 0.5). Rows with 'pending' "
+                "status haven't reached their target_date yet."
+            )
 
     elif family == "sentiment":
         st.subheader("📰 Sentiment — corr(score, forward return)")
@@ -364,41 +376,44 @@ with tab_track:
         if sent_df is None or sent_df.empty:
             st.info("No sentiment predictions logged yet.")
         else:
-            ev = sent_df[sent_df["status"] == "evaluated"]
-            if ev.empty:
-                st.info(
-                    "No evaluated sentiment predictions yet (needs the forward "
-                    "window to pass). There is no per-row 'correct' for sentiment."
-                )
-            else:
-                for name, grp in ev.groupby("model_name"):
-                    grp = grp.sort_values("as_of_date")
-                    score = grp["sentiment_score"]
-                    fwd = grp["sentiment_fwd_return"]
+            for name, grp in sent_df.groupby("model_name"):
+                grp = grp.sort_values("as_of_date", ascending=False)
+                ev = grp[grp["status"] == "evaluated"]
+                st.markdown(f"**{name}**")
+                c1, c2 = st.columns(2)
+                c1.metric("Evaluated / total", f"{len(ev)} / {len(grp)}")
+                if not ev.empty:
+                    score = ev["sentiment_score"]
+                    fwd = ev["sentiment_fwd_return"]
                     valid = score.notna() & fwd.notna()
                     if valid.sum() >= 2 and score[valid].nunique() > 1:
                         corr = float(score[valid].corr(fwd[valid]))
                     else:
                         corr = float("nan")
-                    st.markdown(f"**{name}**")
-                    c1, c2 = st.columns(2)
-                    c1.metric("Evaluated", len(grp))
                     c2.metric("corr(score, fwd_return)", f"{corr:.3f}" if corr == corr else "n/a")
-                    st.dataframe(
-                        grp[[
-                            "as_of_date", "sentiment_score", "sentiment_label",
-                            "n_headlines", "sentiment_fwd_return", "sentiment_fwd_vol",
-                        ]],
-                        width="stretch", hide_index=True,
-                    )
-                    st.divider()
-                st.caption(
-                    "Baseline: `lexicon_sentiment_v1` (keyword lexicon, deterministic). "
-                    "Correlation, not accuracy — sentiment has no realized label."
+                else:
+                    c2.metric("corr(score, fwd_return)", "n/a")
+                st.dataframe(
+                    grp[[
+                        "as_of_date", "sentiment_score", "sentiment_label",
+                        "n_headlines", "sentiment_fwd_return", "sentiment_fwd_vol", "status",
+                    ]],
+                    width="stretch", hide_index=True,
                 )
+                st.divider()
+            st.caption(
+                "Baseline: `lexicon_sentiment_v1` (keyword lexicon, deterministic). "
+                "Correlation, not accuracy — sentiment has no realized label. Rows "
+                "with 'pending' status haven't reached their target_date yet."
+            )
 
     st.divider()
     st.subheader("⚖️ Risk policies — Sharpe / max DD / Calmar / total return")
+    st.caption(
+        "This section is independent of the dropdown above: it's a portfolio-level "
+        "backtest, not a per-day prediction log, so it always shows here regardless "
+        "of which model type you pick."
+    )
     if not RISK_POLICY_RESULTS.exists():
         st.info(
             "No risk-policy results yet. Run scripts/evaluate_risk_policies.py "
@@ -535,4 +550,3 @@ with tab_backtest:
     )
     st.plotly_chart(fig_eq, width="stretch")
     st.code(result.summary())
-
