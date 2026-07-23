@@ -83,6 +83,57 @@ def predict_next_day(
     )
 
 
+def predict_next_day_har(
+    profile: str | None = None,
+    refresh: bool = False,
+) -> Prediction:
+    """Predict forward volatility with the HAR-RV model (Phase 2 winner).
+
+    HAR-RV beats the LightGBM regressor in purged walk-forward on both daily
+    and hourly BTC, so it is the primary vol forecaster. It has no separate
+    regime classifier, so ``regime`` is flagged by comparing the forecast
+    against recent realized vol and ``regime_proba`` is ``None``. Sizing uses
+    the same :func:`recommend_weight` vol-targeting as the LightGBM path.
+    """
+    from coinpredictor.vol_baselines import har_latest_forecast
+
+    ohlcv = load_ohlcv(refresh=refresh)
+    as_of, predicted_vol, trailing_vol = har_latest_forecast(
+        ohlcv, ann=MODEL.annualization, horizon=MODEL.vol_horizon
+    )
+    profile = profile or STRATEGY.live_profile
+    weight = recommend_weight(predicted_vol, regime_proba=None, profile=profile)
+
+    return Prediction(
+        as_of_date=as_of,
+        predicted_vol=predicted_vol,
+        trailing_vol=trailing_vol,
+        regime="ELEVATED" if predicted_vol > trailing_vol else "CALM",
+        regime_proba=None,
+        last_close=float(ohlcv.loc[as_of, "close"]),
+        profile=profile,
+        recommended_weight=weight,
+    )
+
+
+def predict_primary_vol(
+    profile: str | None = None,
+    refresh: bool = False,
+) -> Prediction:
+    """Predict forward volatility with the family's PRIMARY model.
+
+    Resolves ``registry.PRIMARY_MODEL["volatility"]`` and dispatches to the
+    matching predictor, so live advice (bot, dashboard, CLI) always tracks the
+    currently-promoted model without duplicating the selection logic. Defaults
+    to the LightGBM path if the primary is anything other than HAR-RV.
+    """
+    from coinpredictor.registry import PRIMARY_MODEL
+
+    if PRIMARY_MODEL["volatility"] == "har_rv_volatility_v1":
+        return predict_next_day_har(profile=profile, refresh=refresh)
+    return predict_next_day(profile=profile, refresh=refresh)
+
+
 if __name__ == "__main__":  # pragma: no cover - CLI
     import sys
 
@@ -91,11 +142,11 @@ if __name__ == "__main__":  # pragma: no cover - CLI
     # Optional first arg selects the risk profile; default shows all three.
     arg = sys.argv[1] if len(sys.argv) > 1 else None
     if arg:
-        print(predict_next_day(refresh=True, profile=arg).summary())
+        print(predict_primary_vol(refresh=True, profile=arg).summary())
     else:
-        pred = predict_next_day(refresh=True)
+        pred = predict_primary_vol(refresh=True)
         print(pred.summary())
         print("\nWeight by risk profile:")
         for name in STRATEGY_PROFILES:
-            w = predict_next_day(profile=name).recommended_weight
+            w = predict_primary_vol(profile=name).recommended_weight
             print(f"  {name:11s}: {w:.0%} BTC / {1 - w:.0%} cash")

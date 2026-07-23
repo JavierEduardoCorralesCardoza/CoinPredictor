@@ -31,6 +31,7 @@ from coinpredictor.config import (  # noqa: E402
     ENTRY_LOG,
     JUDGE,
     JUDGE_LOG,
+    META_LABELING_RESULTS_DAILY,
     MODEL,
     RISK_POLICY_RESULTS,
     SENTIMENT_LOG,
@@ -45,7 +46,7 @@ from coinpredictor.model import (  # noqa: E402
     regressor_importances,
     train_and_save,
 )
-from coinpredictor.predict import predict_next_day  # noqa: E402
+from coinpredictor.predict import predict_primary_vol  # noqa: E402
 
 st.set_page_config(page_title="CoinPredictor — BTC Volatility", layout="wide")
 
@@ -118,8 +119,8 @@ st.caption(
     "more predictable than price direction."
 )
 
-# --- Live prediction (primary production model) ------------------------------
-pred = predict_next_day(artifact=artifact, refresh=False)
+# --- Live prediction (primary production model: HAR-RV) ----------------------
+pred = predict_primary_vol(refresh=False)
 vol_delta = pred.predicted_vol - pred.trailing_vol
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Last close", f"${pred.last_close:,.0f}", help=str(pred.as_of_date.date()))
@@ -431,6 +432,41 @@ with tab_track:
         st.caption(
             "Baseline: `buy_and_hold` (FixedWeightPolicy 100%). A sizing policy "
             "earns its keep only by beating it on risk-adjusted return."
+        )
+
+    st.divider()
+    st.subheader("🎯 Directional meta-labeling (Phase 3) — drawdown control")
+    st.caption(
+        "A DIFFERENT backtest from the sizing policies above: a low-turnover "
+        "trend filter (primary side) gated by a purged walk-forward meta-model "
+        "with volatility-scaled barriers, net of realistic costs. Its edge is "
+        "cutting max drawdown, not beating buy & hold on Sharpe. Regenerate with "
+        "`python scripts/evaluate_risk_policies.py --with-meta`."
+    )
+    if not META_LABELING_RESULTS_DAILY.exists():
+        st.info(
+            "No meta-labeling results yet. Run "
+            "`python scripts/evaluate_risk_policies.py --with-meta` (or "
+            "`python -m coinpredictor.meta_labeling --vol-scaled`)."
+        )
+    else:
+        meta_df = pd.read_csv(META_LABELING_RESULTS_DAILY)
+        fmt = {"sharpe": "{:.2f}", "total_return": "{:.1%}",
+               "max_drawdown": "{:.1%}", "avg_turnover": "{:.3f}",
+               "exposure": "{:.0%}"}
+        if "deflated_sharpe_best" in meta_df.columns:
+            fmt["deflated_sharpe_best"] = "{:.3f}"
+        st.dataframe(
+            meta_df.sort_values("sharpe", ascending=False).style.format(
+                {k: v for k, v in fmt.items() if k in meta_df.columns}
+            ),
+            width="stretch", hide_index=True,
+        )
+        st.caption(
+            "`buy_and_hold` and `primary_only` are the baselines; `meta thr=…` "
+            "rows sit out low-conviction days. `deflated_sharpe_best` discounts "
+            "the best strategy for the number of thresholds tried (>0.95 = "
+            "credible edge)."
         )
 
 

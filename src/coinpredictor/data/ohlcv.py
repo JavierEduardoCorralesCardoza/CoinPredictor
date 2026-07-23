@@ -82,7 +82,13 @@ def download_ohlcv(
 
 
 def load_ohlcv(refresh: bool = False, cache_path: Path | None = None) -> pd.DataFrame:
-    """Return OHLCV data, using the on-disk cache when available.
+    """Return OHLCV data, preferring clean exchange candles.
+
+    When ``DATA.use_exchange_ohlcv`` is set (default), daily candles are pulled
+    from a spot exchange via ccxt (clean, reliable, no API key) and only fall
+    back to yfinance if the exchange is unreachable. yfinance keeps longer daily
+    history but is intermittently flaky, so it is the safety net, not the
+    primary source.
 
     Parameters
     ----------
@@ -92,8 +98,26 @@ def load_ohlcv(refresh: bool = False, cache_path: Path | None = None) -> pd.Data
         cache -- but only if it isn't older than _MAX_STALE_CACHE_DAYS,
         to avoid silently serving stale data indefinitely.
     cache_path:
-        Override the default cache location (useful for tests).
+        Override the default yfinance cache location (useful for tests).
     """
+    if DATA.use_exchange_ohlcv:
+        try:
+            from coinpredictor.data.exchange_ohlcv import load_exchange_ohlcv
+
+            return load_exchange_ohlcv(timeframe="1d", refresh=refresh)
+        except Exception as e:  # exchange unreachable / ccxt missing
+            log.warning(
+                "load_ohlcv: exchange source failed (%s); falling back to yfinance",
+                e,
+            )
+
+    return _load_ohlcv_yfinance(refresh=refresh, cache_path=cache_path)
+
+
+def _load_ohlcv_yfinance(
+    refresh: bool = False, cache_path: Path | None = None
+) -> pd.DataFrame:
+    """yfinance-backed OHLCV with an on-disk cache and stale-cache guard."""
     cache_path = cache_path or _CACHE_FILE
 
     if not refresh and cache_path.exists():

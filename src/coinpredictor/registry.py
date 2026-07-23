@@ -88,6 +88,35 @@ class NaiveVolatilityAdapter:
         }
 
 
+@dataclass
+class HARVolatilityAdapter:
+    """HAR-RV volatility model (Phase 2). Corsi's heterogeneous-autoregressive
+    OLS over Garman-Klass daily/weekly/monthly components. In purged
+    walk-forward it BEATS the LightGBM regressor on both daily and hourly BTC
+    (positive R² where LightGBM is ~0), because a parsimonious range-based
+    persistence model captures vol level better than a high-dimensional booster
+    fed noisy price technicals."""
+
+    name: str = "har_rv_volatility_v1"
+    target_type: str = "volatility"
+
+    def predict(self, refresh: bool = False) -> dict:
+        # Single source of truth: the same HAR predictor the bot/dashboard use.
+        from coinpredictor.predict import predict_next_day_har
+
+        p = predict_next_day_har(refresh=refresh)
+        return {
+            "as_of_date": p.as_of_date,
+            "last_close": p.last_close,
+            "predicted_vol": p.predicted_vol,
+            "trailing_vol": p.trailing_vol,
+            "regime_pred": p.regime,
+            "regime_proba": p.regime_proba,
+            "profile": p.profile,
+            "recommended_weight": p.recommended_weight,
+        }
+
+
 # --- Trend-regime family (Phase 1b) -----------------------------------------
 @dataclass
 class SmaCrossTrendAdapter:
@@ -286,6 +315,7 @@ class LLMSentimentAdapter:
 MODELS: list[ModelAdapter] = [
     LGBMVolatilityAdapter(),
     NaiveVolatilityAdapter(),
+    HARVolatilityAdapter(),
     SmaCrossTrendAdapter(),
     LGBMTrendRegimeAdapter(),
     RandomEntryAdapter(),
@@ -308,7 +338,9 @@ LOG_FILE_BY_TARGET_TYPE: dict[str, Path] = {
 # The single "primary" model per family. Phase 3's judge reads exactly these
 # to assemble its context, so defining it here now avoids a later rework.
 PRIMARY_MODEL: dict[str, str] = {
-    "volatility": "lgbm_volatility_v1",
+    # HAR-RV beats the LightGBM regressor in purged walk-forward on both daily
+    # and hourly BTC (positive R² vs ~0), so it is the primary vol forecaster.
+    "volatility": "har_rv_volatility_v1",
     "trend_regime": "lgbm_trend_v1",
     "entry": "lgbm_entry_v1",
     "sentiment": "finbert_sentiment_v1",

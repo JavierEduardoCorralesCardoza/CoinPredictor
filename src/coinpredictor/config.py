@@ -34,6 +34,9 @@ TREND_REGIME_LOG = PROCESSED_DIR / "trend_regime_log.csv"
 ENTRY_LOG = PROCESSED_DIR / "entry_log.csv"
 SENTIMENT_LOG = PROCESSED_DIR / "sentiment_log.csv"
 RISK_POLICY_RESULTS = PROCESSED_DIR / "risk_policy_results.csv"
+# Phase 3 directional meta-labeling backtest (one row per strategy). Written by
+# scripts/evaluate_risk_policies.py --with-meta / coinpredictor.meta_labeling.
+META_LABELING_RESULTS_DAILY = PROCESSED_DIR / "meta_labeling_results_1d.csv"
 JUDGE_LOG = PROCESSED_DIR / "judge_log.csv"
 
 
@@ -62,6 +65,17 @@ class DataConfig:
     btc_ticker: str = "BTC-USD"          # yfinance ticker
     start_date: str = "2015-01-01"        # earliest reliable daily BTC data
     interval: str = "1d"                   # daily candles -> next-day horizon
+
+    # --- Exchange-native OHLCV (ccxt, data-quality upgrade) ------------------
+    # When True, load_ohlcv() prefers clean exchange candles and only falls back
+    # to yfinance if the exchange is unreachable. OKX needs no API key and is not
+    # geo-blocked (Binance/Bybit are, in some regions -- see funding.py).
+    use_exchange_ohlcv: bool = True
+    exchange_id: str = "okx"             # any ccxt exchange id
+    exchange_symbol: str = "BTC/USDT"    # ccxt unified spot symbol
+    exchange_start: str = "2017-01-01"    # OKX BTC/USDT history depth
+    # Intraday timeframe used when comparing daily vs intraday models.
+    intraday_interval: str = "1h"
 
     # Phase 2 macro tickers (yfinance, free, no key)
     macro_tickers: dict = field(
@@ -117,6 +131,23 @@ class ModelConfig:
             "min_child_samples": 40,
         }
     )
+
+
+# --- Intraday parameters -----------------------------------------------------
+@dataclass(frozen=True)
+class IntradayConfig:
+    """Timeframe-aware settings for the hourly (intraday) pipeline.
+
+    The daily config measures vol in *days*; on hourly candles the same rolling
+    windows and annualization would be wrong. These values let the same feature
+    builder produce a comparable intraday model: forward realized vol over the
+    next ``vol_horizon`` hours, annualized with ~8760 hours/year.
+    """
+
+    interval: str = "1h"
+    annualization: int = 24 * 365          # ~8760 hourly periods per year
+    vol_horizon: int = 24                   # forward window: next 24 hours (~1 day)
+    regime_lookback: int = 24 * 7           # trailing norm: past 7 days
 
 
 # --- Strategy parameters -----------------------------------------------------
@@ -234,6 +265,7 @@ class JudgeConfig:
 
 DATA = DataConfig()
 MODEL = ModelConfig()
+INTRADAY = IntradayConfig()
 STRATEGY = StrategyConfig()
 FEATURES = FeatureConfig()
 TREND = TrendConfig()

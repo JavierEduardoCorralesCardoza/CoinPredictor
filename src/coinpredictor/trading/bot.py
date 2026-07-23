@@ -19,7 +19,7 @@ from __future__ import annotations
 import argparse
 
 from coinpredictor.config import STRATEGY
-from coinpredictor.predict import predict_next_day
+from coinpredictor.predict import predict_primary_vol
 from coinpredictor.trading.paper_broker import PaperBroker
 
 
@@ -55,7 +55,7 @@ def run_once(
     """Execute a single predict -> rebalance cycle against the paper portfolio."""
     profile = profile or STRATEGY.live_profile
 
-    pred = predict_next_day(profile=profile)
+    pred = predict_primary_vol(profile=profile)
     price, source = live_price()
 
     broker = PaperBroker.load_or_create(initial_capital)

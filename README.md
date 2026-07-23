@@ -2,8 +2,9 @@
 
 Forecasts **Bitcoin's forward realized volatility** (how turbulent the next few
 days will be) and the **volatility regime** (calm vs. elevated vs. the recent
-norm), using free market data, technical indicators, and LightGBM. Ships with
-research notebooks and an interactive Streamlit dashboard.
+norm), using free market data, technical indicators, a parsimonious **HAR-RV**
+model (the primary forecaster) and LightGBM. Ships with research notebooks and
+an interactive Streamlit dashboard.
 
 > ⚠️ **Educational project, not financial advice.** Unlike price *direction*
 > (which is close to a coin flip), Bitcoin *volatility clusters* and is far more
@@ -20,13 +21,26 @@ research notebooks and an interactive Streamlit dashboard.
 ## Features
 
 - **Phase 1** — OHLCV + technical indicators (RSI, MACD, moving averages,
-  Bollinger Bands, ATR, lagged returns, rolling/realized volatility, volume).
-- **Phase 2** — Macro signals (S&P 500, Gold, US Dollar index) via yfinance.
-- **Phase 3** — Sentiment (Crypto Fear & Greed, optional NewsAPI) and on-chain
-  metrics (hash rate, transaction count, miner revenue) via blockchain.info.
-- **Walk-forward validation** (`TimeSeriesSplit`) and explicit no-leakage design.
-- **Volatility-targeting backtest** vs buy-and-hold (Sharpe + max drawdown).
-- **Streamlit dashboard**: live forecast, regime, equity curve, charts, importance.
+  Bollinger Bands, ATR, lagged returns, rolling/realized volatility, volume),
+  plus **Garman-Klass** range-based volatility and its daily/weekly/monthly
+  **HAR** components.
+- **Phase 2** — Macro signals (S&P 500, Gold, US Dollar index) and **classical
+  volatility baselines** (naive persistence, HAR-RV, GARCH/EGARCH) that every ML
+  model must beat.
+- **Phase 3** — Sentiment (Crypto Fear & Greed, optional NewsAPI), on-chain
+  metrics (hash rate, transaction count, miner revenue), **free derivatives**
+  (OKX funding, Deribit DVOL), and **directional meta-labeling**.
+- **Robust exchange OHLCV** via ccxt/OKX (daily + hourly), replacing flaky
+  yfinance for BTC, with an incremental parquet cache.
+- **Honest out-of-sample validation** — purged walk-forward, embargo, and the
+  **Deflated Sharpe Ratio** to discount strategies found by trial-and-error.
+- **Volatility-targeting backtest** vs buy-and-hold (Sharpe + max drawdown),
+  net of realistic commissions and slippage.
+- **HAR-RV is the production forecaster**: `predict.py`, the paper-trading bot,
+  and the dashboard headline all size exposure from the HAR-RV forecast (the
+  purged-walk-forward winner), not the LightGBM artifact.
+- **Streamlit dashboard**: live forecast, regime, equity curve, charts,
+  importance, risk-policy leaderboard, and a directional meta-labeling panel.
 
 ## Project structure
 
@@ -36,12 +50,18 @@ CoinPredictor/
 ├── models/                      # trained artifacts (gitignored)
 ├── notebooks/                   # research workflow
 ├── src/coinpredictor/
-│   ├── config.py                # paths, symbols, vol & strategy settings
-│   ├── data/                    # ohlcv, macro, onchain, sentiment loaders
-│   ├── features.py              # indicators + forward-vol targets (no leakage)
+│   ├── config.py                # paths, symbols, vol/intraday & strategy settings
+│   ├── data/                    # ohlcv, exchange_ohlcv, macro, onchain,
+│   │                            #   sentiment, funding, implied_vol loaders
+│   ├── features.py              # indicators + GK/HAR + forward-vol targets (no leakage)
 │   ├── model.py                 # vol regressor + regime classifier, walk-forward CV
+│   ├── vol_baselines.py         # classical HAR-RV / GARCH baselines (Phase 2)
+│   ├── meta_labeling.py         # directional trend + meta-label filter (Phase 3)
+│   ├── validation.py            # purged walk-forward + Deflated Sharpe
+│   ├── registry.py              # model families run + logged side by side
 │   ├── backtest.py              # volatility-targeting strategy vs buy-and-hold
 │   └── predict.py               # live forward-volatility forecast
+├── scripts/diagnose.py          # Phase 0 honest diagnostic (leakage / baseline / edge)
 ├── dashboard/app.py             # Streamlit UI
 └── tests/                       # leakage / feature / model / backtest tests
 ```
@@ -103,6 +123,30 @@ python -m coinpredictor.backtest
 streamlit run dashboard/app.py
 ```
 
+### Research & evaluation entry points
+
+```powershell
+# Phase 0 — honest diagnostic: leakage check, baseline gap, strategy vs
+# buy-and-hold net of costs + Deflated Sharpe (add --intraday for hourly)
+python scripts/diagnose.py
+python scripts/diagnose.py --intraday
+
+# Phase 2 — classical volatility baselines vs LightGBM (purged walk-forward)
+python -m coinpredictor.vol_baselines            # daily
+python -m coinpredictor.vol_baselines --intraday # hourly
+python -m coinpredictor.vol_baselines --egarch   # EGARCH instead of GARCH
+
+# Phase 3 — directional meta-labeling (trend primary + meta-label filter)
+python -m coinpredictor.meta_labeling                 # daily, fixed barriers
+python -m coinpredictor.meta_labeling --vol-scaled    # volatility-scaled barriers
+python -m coinpredictor.meta_labeling --intraday      # hourly
+python -m coinpredictor.meta_labeling --derivatives   # add free funding + DVOL
+
+# Risk policies (sizing) + optionally the defensive meta-labeling strategy
+python scripts/evaluate_risk_policies.py              # long-only sizing policies
+python scripts/evaluate_risk_policies.py --with-meta  # also refresh meta-labeling
+```
+
 ### Using extra feature phases
 
 ```python
@@ -134,11 +178,45 @@ verifies future prices never influence past feature values.
 - Validation always trains on the past and tests on the future
   (`TimeSeriesSplit`); data is never shuffled.
 
+## Honest evaluation & findings
+
+The project is validated the hard way: a **purged** walk-forward (with an
+embargo around each test fold so the forward-looking target can't leak into
+training) plus the **Deflated Sharpe Ratio**, which discounts a strategy's
+Sharpe by how many variants were tried before finding it. Backtests are net of
+realistic commissions and slippage. Run `python scripts/diagnose.py` to
+reproduce the numbers below.
+
+What the evidence actually says (BTC, out-of-sample):
+
+- **Volatility level is predictable — and a simple model wins.** A parsimonious
+  **HAR-RV** (Corsi) over Garman-Klass daily/weekly/monthly components beats the
+  LightGBM regressor on both daily (R² ≈ +0.13 vs ≈ 0) and hourly (R² ≈ +0.36
+  vs +0.32) data. HAR-RV is therefore the **primary** volatility model; GARCH(1,1)
+  underperforms even naive persistence on daily data.
+- **Direction is hard.** A daily trend filter (SMA 20/50) roughly matches
+  buy-and-hold on Sharpe while cutting max drawdown from ≈ −77 % to ≈ −59 %.
+  Adding a meta-label filter with volatility-scaled barriers cuts drawdown
+  further (to ≈ −20 %) but does **not** beat buy-and-hold on Sharpe, and the
+  intraday directional signal fails outright.
+- **Bottom line:** the robust wins so far are a *better volatility model*
+  (HAR-RV) and *drawdown reduction*, not a directional edge. Free derivatives
+  (funding, DVOL) did not unlock one — so paying for premium data is **not yet
+  justified** by the evidence.
+
+HAR-RV is wired end-to-end: the live prediction, the paper-trading bot, and the
+dashboard headline all use it via `predict_primary_vol`, and the defensive
+directional meta-labeling strategy is refreshed with
+`python scripts/evaluate_risk_policies.py --with-meta` and shown in the
+dashboard's Track Record tab.
+
 ## Data sources (all free)
 
 | Source | Used for | Key required |
 | --- | --- | --- |
-| yfinance | BTC OHLCV, macro | No |
+| ccxt / OKX | BTC OHLCV (daily + hourly), funding | No |
+| yfinance | Macro (S&P 500, Gold, DXY), OHLCV fallback | No |
+| Deribit | BTC implied volatility (DVOL) | No |
 | blockchain.info | On-chain metrics | No |
 | alternative.me | Fear & Greed index | No |
 | NewsAPI | Headline counts | Free key (optional) |
@@ -151,9 +229,9 @@ families** side by side. Each family has its OWN csv log, its OWN required
 naive/free baseline, and its OWN leaderboard metric (one leaderboard per family
 in the dashboard's Track Record tab).
 
-| Family | File | Baseline | Real model | Metric |
+| Family | File | Baseline | Primary model | Metric |
 | --- | --- | --- | --- | --- |
-| volatility | `volatility_log.csv` | `naive_persistence_v1` | `lgbm_volatility_v1` | MAE / RMSE |
+| volatility | `volatility_log.csv` | `naive_persistence_v1` | `har_rv_volatility_v1` | MAE / RMSE |
 | trend regime | `trend_regime_log.csv` | `sma_cross_trend_v1` | `lgbm_trend_v1` | accuracy + per-class F1 |
 | entry | `entry_log.csv` | `baseline_entry_v1` | `lgbm_entry_v1` | precision / recall / calibration |
 | sentiment | `sentiment_log.csv` | `lexicon_sentiment_v1` | `finbert_sentiment_v1` | corr(score, fwd return) |

@@ -102,6 +102,8 @@ def build_features(
     return_lags: tuple[int, ...] = (1, 2, 3, 5, 10),
     sma_windows: tuple[int, ...] = (5, 10, 20, 50),
     horizon: int | None = None,
+    annualization: int | None = None,
+    regime_lookback: int | None = None,
     drop_na: bool = True,
 ) -> pd.DataFrame:
     """Construct the model-ready feature matrix plus the target column.
@@ -164,10 +166,26 @@ def build_features(
     out["hl_range"] = (out["high"] - out["low"]) / close
 
     # Trailing annualized realized volatility (past-only feature & regime base).
-    ann = np.sqrt(MODEL.annualization)
+    ann_periods = annualization if annualization is not None else MODEL.annualization
+    lookback = regime_lookback if regime_lookback is not None else MODEL.regime_lookback
+    ann = np.sqrt(ann_periods)
     out["realized_vol_trailing"] = (
-        out["log_return_1d"].rolling(MODEL.regime_lookback).std() * ann
+        out["log_return_1d"].rolling(lookback).std() * ann
     )
+
+    # Garman-Klass range-based volatility + HAR components (Phase 2). The GK
+    # estimator uses the full OHLC bar, so it is far more efficient than a
+    # close-to-close measure on daily data; the daily/weekly/monthly averages
+    # give the model the heterogeneous-autoregressive (HAR) persistence
+    # structure that proved strongly predictive of forward vol. All past-only.
+    with np.errstate(divide="ignore", invalid="ignore"):
+        _gk_var = 0.5 * np.log(out["high"] / out["low"]) ** 2 - (
+            2.0 * np.log(2.0) - 1.0
+        ) * np.log(out["close"] / out["open"]) ** 2
+    _gk_var = _gk_var.clip(lower=0.0)
+    out["gk_vol_1d"] = np.sqrt(_gk_var) * ann
+    out["gk_vol_5d"] = np.sqrt(_gk_var.rolling(5).mean()) * ann
+    out["gk_vol_22d"] = np.sqrt(_gk_var.rolling(22).mean()) * ann
 
     # --- Targets: forward realized volatility --------------------------------
     # Forward h-day realized volatility (annualized). rolling(h).std() at index
@@ -308,3 +326,115 @@ def build_default_features(
         refresh=refresh,
         drop_na=drop_na,
     )
+
+
+# --- Intraday feature builder ------------------------------------------------
+def _map_daily_to_intraday(
+    daily_df: pd.DataFrame, intraday_index: pd.DatetimeIndex
+) -> pd.DataFrame:
+    """Broadcast daily-resolution features onto an intraday index by date.
+
+    Each intraday timestamp inherits the feature value of its calendar date.
+    The caller is expected to have already shifted ``daily_df`` by one day so a
+    day's fully-formed daily feature is only visible on the *following* day's
+    bars (no same-day look-ahead).
+    """
+    dates = pd.DatetimeIndex(intraday_index).normalize()
+    grid = pd.DatetimeIndex(dates.unique()).union(daily_df.index)
+    aligned = daily_df.reindex(grid).ffill().reindex(dates)
+    aligned.index = intraday_index
+    return aligned
+
+
+def build_intraday_features(
+    df: pd.DataFrame,
+    *,
+    use_macro: bool = False,
+    use_onchain: bool = False,
+    use_sentiment: bool = False,
+    use_implied_vol: bool = False,
+    use_funding: bool = False,
+    horizon: int | None = None,
+    refresh: bool = False,
+    drop_na: bool = True,
+) -> pd.DataFrame:
+    """Build a timeframe-aware feature matrix for intraday (hourly) candles.
+
+    Technical features use intraday-scaled annualization and lookbacks
+    (``config.INTRADAY``). External sources are natively daily, so they are
+    computed on the daily calendar, lagged one day to avoid intraday
+    look-ahead, and broadcast onto the hourly index.
+    """
+    from coinpredictor.config import INTRADAY
+
+    base = build_features(
+        df,
+        horizon=horizon or INTRADAY.vol_horizon,
+        annualization=INTRADAY.annualization,
+        regime_lookback=INTRADAY.regime_lookback,
+        drop_na=False,
+    )
+    intraday_index = base.index
+    daily_index = pd.DatetimeIndex(sorted(set(intraday_index.normalize())))
+
+    extras: list[pd.DataFrame] = []
+
+    def add(name: str, fetch_fn) -> None:
+        try:
+            daily_feat = fetch_fn(daily_index, refresh=refresh).shift(1)
+            extras.append(_map_daily_to_intraday(daily_feat, intraday_index))
+        except Exception as exc:  # noqa: BLE001 - network/parse failures vary
+            warnings.warn(
+                f"Skipping {name} intraday features: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+    if use_macro:
+        from coinpredictor.data.macro import macro_features
+
+        add("macro", macro_features)
+    if use_onchain:
+        from coinpredictor.data.onchain import onchain_features
+
+        add("on-chain", onchain_features)
+    if use_sentiment:
+        from coinpredictor.data.sentiment import sentiment_features
+
+        add("sentiment", sentiment_features)
+    if use_implied_vol:
+        from coinpredictor.data.implied_vol import implied_vol_features
+
+        add("implied-vol", implied_vol_features)
+    if use_funding:
+        from coinpredictor.data.funding import funding_features
+
+        add("funding", funding_features)
+
+    combined = pd.concat([base, *extras], axis=1) if extras else base
+
+    if drop_na:
+        combined = combined.dropna()
+        combined[MODEL.regime_col] = combined[MODEL.regime_col].astype(int)
+
+    return combined
+
+
+def build_default_intraday_features(
+    df: pd.DataFrame, *, horizon: int | None = None, refresh: bool = False, drop_na: bool = True
+) -> pd.DataFrame:
+    """Intraday feature set selected by ``config.FEATURES`` (+ Phase 4 flags)."""
+    from coinpredictor.config import FEATURES
+
+    return build_intraday_features(
+        df,
+        use_macro=FEATURES.use_macro,
+        use_onchain=FEATURES.use_onchain,
+        use_sentiment=FEATURES.use_sentiment,
+        use_implied_vol=FEATURES.use_implied_vol,
+        use_funding=FEATURES.use_funding,
+        horizon=horizon,
+        refresh=refresh,
+        drop_na=drop_na,
+    )
+
