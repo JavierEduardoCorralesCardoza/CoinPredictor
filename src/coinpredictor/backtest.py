@@ -20,7 +20,7 @@ from typing import Protocol
 import numpy as np
 import pandas as pd
 
-from coinpredictor.config import MODEL, STRATEGY
+from coinpredictor.config import COSTS, MODEL, STRATEGY
 from coinpredictor.features import feature_columns
 
 
@@ -195,7 +195,7 @@ def walk_forward_backtest(
     model_factory,
     features_df: pd.DataFrame,
     n_splits: int | None = None,
-    fee: float = 0.001,
+    fee: float = COSTS.per_side,
     *,
     power: float = 1.0,
     clf_factory=None,
@@ -402,7 +402,7 @@ def backtest_policy(
     predicted_vol: pd.Series,
     regime_proba: pd.Series | None = None,
     trend_regime: pd.Series | None = None,
-    fee: float = 0.001,
+    fee: float = COSTS.per_side,
 ) -> dict:
     """Replay a sizing policy over pre-computed OOS forecasts; return metrics."""
     df = features_df.copy()

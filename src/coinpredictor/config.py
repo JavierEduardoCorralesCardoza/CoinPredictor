@@ -164,6 +164,95 @@ class StrategyConfig:
     live_profile: str = "balanced"
 
 
+# --- Trading-cost model ------------------------------------------------------
+@dataclass(frozen=True)
+class CostConfig:
+    """Realistic proportional trading costs charged in every backtest.
+
+    Backtests must NEVER run cost-free by default: fees, half the bid/ask spread
+    and slippage are all charged whenever exposure changes, so a strategy has to
+    clear a real hurdle before it can PASS the gate.
+    """
+
+    taker_fee: float = 0.001       # exchange taker fee (10 bps)
+    half_spread: float = 0.0003    # half the bid/ask spread (3 bps)
+    slippage: float = 0.0002       # market-impact slippage (2 bps)
+    min_notional_usd: float = 10.0  # ignore trades smaller than this
+
+    @property
+    def per_side(self) -> float:
+        """All-in proportional cost charged on one side of a trade."""
+        return self.taker_fee + self.half_spread + self.slippage
+
+    @property
+    def round_trip(self) -> float:
+        """All-in proportional cost for a full round-trip (enter + exit)."""
+        return self.per_side * 2.0
+
+
+# --- Pre-registered strategy gate --------------------------------------------
+@dataclass(frozen=True)
+class GateConfig:
+    """Pre-registered go/no-go criteria a strategy must clear to be trusted.
+
+    Registering these thresholds BEFORE searching guards against p-hacking: a
+    variant only PASSes if it beats the benchmark Sharpe net of costs, survives
+    deflation (Deflated Sharpe probability >= threshold, which discounts the
+    number of trials), fits the drawdown budget and earns a positive net return.
+    """
+
+    min_deflated_sharpe_prob: float = 0.95      # deflated-Sharpe confidence
+    require_beat_benchmark_sharpe: bool = True  # must beat the benchmark Sharpe
+    max_drawdown_limit: float = 0.20            # drawdown budget (20%)
+    min_net_total_return: float = 0.0           # net return must be positive
+
+
+# --- Cross-sectional crypto momentum -----------------------------------------
+@dataclass(frozen=True)
+class MomentumConfig:
+    """Cross-sectional momentum over a liquid crypto universe."""
+
+    universe: tuple[str, ...] = (
+        "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT",
+        "ADA/USDT", "DOGE/USDT", "AVAX/USDT", "LINK/USDT", "DOT/USDT",
+        "LTC/USDT", "TRX/USDT", "ATOM/USDT", "ETC/USDT", "XLM/USDT",
+        "BCH/USDT", "FIL/USDT", "APT/USDT", "ARB/USDT", "OP/USDT",
+    )
+    exchange_id: str = "okx"
+    timeframe: str = "1d"
+    lookbacks: tuple[int, ...] = (30, 60, 90)   # momentum formation windows (days)
+    skip_days: int = 7                          # skip most-recent days (reversal)
+    top_n: tuple[int, ...] = (3, 5)             # long the top-N momentum names
+    rebalance_days: tuple[int, ...] = (7, 30)   # rebalance cadence variants
+    min_history_days: int = 120                 # require this much history
+    vol_lookback: int = 30                      # inverse-vol / vol-target window
+    overlay_target_vols: tuple[float, ...] = (0.1, 0.15, 0.2, 0.3)
+    regime_ma_days: int = 100                   # BTC trend filter (SMA length)
+
+
+# --- Cross-asset diversified portfolio ---------------------------------------
+@dataclass(frozen=True)
+class DiversifiedConfig:
+    """Cross-asset portfolio: equities + bonds + gold + a capped crypto sleeve."""
+
+    assets: dict = field(
+        default_factory=lambda: {
+            "btc": "BTC-USD",     # crypto sleeve
+            "equities": "SPY",    # US equities
+            "bonds": "TLT",       # long US Treasuries
+            "gold": "GLD",        # gold
+        }
+    )
+    crypto_key: str = "btc"
+    start_date: str = "2015-01-01"
+    periods_per_year: int = 252            # equity trading calendar
+    vol_lookback: int = 60                 # inverse-vol / vol-target window
+    rebalance_days: int = 21               # ~monthly rebalance
+    crypto_cap: float = 0.25               # max crypto weight
+    weight_schemes: tuple[str, ...] = ("equal", "inverse_vol")
+    portfolio_target_vols: tuple[float | None, ...] = (None, 0.08, 0.10, 0.12)
+
+
 # --- Feature-phase selection -------------------------------------------------
 @dataclass(frozen=True)
 class FeatureConfig:
@@ -267,6 +356,10 @@ DATA = DataConfig()
 MODEL = ModelConfig()
 INTRADAY = IntradayConfig()
 STRATEGY = StrategyConfig()
+COSTS = CostConfig()
+GATE = GateConfig()
+MOMENTUM = MomentumConfig()
+DIVERSIFIED = DiversifiedConfig()
 FEATURES = FeatureConfig()
 TREND = TrendConfig()
 ENTRY = EntryConfig()

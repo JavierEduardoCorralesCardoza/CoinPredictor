@@ -41,6 +41,9 @@ an interactive Streamlit dashboard.
   purged-walk-forward winner), not the LightGBM artifact.
 - **Streamlit dashboard**: live forecast, regime, equity curve, charts,
   importance, risk-policy leaderboard, and a directional meta-labeling panel.
+- **Cross-asset diversified portfolio** (equities + long bonds + gold + a capped
+  BTC sleeve) that PASSes the pre-registered gate net of costs, with per-year /
+  crisis-window sensitivity, its own dashboard, and a prospective paper gate.
 
 ## Project structure
 
@@ -57,12 +60,14 @@ CoinPredictor/
 │   ├── model.py                 # vol regressor + regime classifier, walk-forward CV
 │   ├── vol_baselines.py         # classical HAR-RV / GARCH baselines (Phase 2)
 │   ├── meta_labeling.py         # directional trend + meta-label filter (Phase 3)
+│   ├── diversified.py           # cross-asset portfolio search + sensitivity + gate
 │   ├── validation.py            # purged walk-forward + Deflated Sharpe
 │   ├── registry.py              # model families run + logged side by side
 │   ├── backtest.py              # volatility-targeting strategy vs buy-and-hold
 │   └── predict.py               # live forward-volatility forecast
 ├── scripts/diagnose.py          # Phase 0 honest diagnostic (leakage / baseline / edge)
 ├── dashboard/app.py             # Streamlit UI
+├── dashboard/diversified_app.py # Streamlit UI for the diversified portfolio
 └── tests/                       # leakage / feature / model / backtest tests
 ```
 
@@ -319,4 +324,73 @@ scripts/run_judge_docker.sh
 Verdicts appear in the dashboard's **LLM Judges** tab (hypothetical equity,
 cumulative cost, hit rate, same-day consistency) — kept fully separate from the
 ML model leaderboards.
+
+## Cross-asset diversified portfolio (the drawdown fix)
+
+Every crypto-*only* experiment hit the same wall: crypto is a single correlated
+risk factor, so no risk management *inside* crypto pulls its drawdown under a
+20 % budget. The evidence-based fix is diversification across *uncorrelated*
+factors — equities (SPY) + long bonds (TLT) + gold (GLD) + a **capped** BTC
+sleeve — weighted equally or by inverse volatility, optionally throttled toward a
+portfolio volatility target, and scored with the SAME cost model and
+pre-registered gate against simply holding BTC.
+
+```powershell
+python -m coinpredictor.diversified                # full offline search on real data
+python -m coinpredictor.diversified --sensitivity  # + per-year & crisis-window stress
+streamlit run dashboard/diversified_app.py         # equity vs BTC vs 60/40, drawdown, weights
+```
+
+**Result (2015→today, net of costs): PASS.** The pre-registered winner
+`equal_vt0.08` (equal-weight, throttled to 8 % portfolio vol) beats holding BTC
+on Sharpe (**1.21 vs 1.03**) while cutting max drawdown from **≈ −83 % to
+≈ −18 %**, and survives deflation. A PASS means *the diversified thesis earns a
+broker* — not "trade it tomorrow".
+
+### Recommended venue/broker (Mexico)
+
+Trading the equity/bond/gold legs needs a broker. For a Mexico-based deployment:
+
+| Sleeve | Venue | Why |
+| --- | --- | --- |
+| SPY / TLT / GLD | **Interactive Brokers** | Real US-listed ETFs (deep liquidity, tight spreads), **fractional shares** for a ~monthly rebalanced small book, commissions ≈ **5 bps** — comfortably under the **15 bps** modelled in `COSTS`. MXN funding via wire. |
+| BTC sleeve | **Bitso** | Regulated Mexican exchange, MXN on/off-ramp. Mind the wider spread vs the 15 bps model. |
+
+> Alternative single-domicile route: **GBM+** (US ETFs via the SIC) + **Bitso**
+> for BTC. Simpler onboarding, but SIC tickers differ and spreads/fees are wider,
+> so verify real fills stay under the modelled 15 bps per side.
+
+### Sub-period & crisis-window sensitivity
+
+The whole point of diversifying is surviving regimes where one factor blows up.
+`--sensitivity` splits the record by calendar year and by pre-registered crisis
+windows (saved to `data/processed/diversified_sensitivity_{annual,stress}.csv`):
+
+- **2022 — the acid test** (stocks *and* long bonds fell together, so the classic
+  60/40 hedge failed): the diversified book still contained its drawdown to
+  **≈ −14 %** with a **−12 %** return, versus **−67 % / −64 %** for BTC and
+  **≈ −26 % / −22 %** for 60/40. The vol-target throttle plus the crypto cap keep
+  it well inside the 20 % budget even in the worst bond regime in decades.
+- Across every year, the diversified variant's drawdown stays shallow while its
+  risk-adjusted return tracks or beats both benchmarks outside raging bull runs.
+
+### Prospective paper gate (live, forward-only)
+
+An offline PASS is in-sample by construction. The honest next step is a
+*prospective* paper run: freeze the winning variant, then track a **simulated**
+multi-asset book (cash + fractional units, same `COSTS`) against 100 % BTC and
+60/40 on live prices — one rebalance per invocation — and re-score the SAME gate
+on the purely out-of-sample record once ≥ 30 live observations accumulate
+(`n_trials=1`: the variant is frozen, so there is nothing to deflate).
+
+```powershell
+python -m coinpredictor.trading.diversified_paper            # one live rebalance
+python -m coinpredictor.trading.diversified_paper --status   # print the track record
+python -m coinpredictor.trading.diversified_paper --gate     # score the prospective gate
+```
+
+> 📝 **100 % paper trading** — state lives in
+> `data/processed/diversified_paper_state.json` (gitignored) and never touches
+> real funds. Delete it to restart the 6-week forward run from scratch.
+
 

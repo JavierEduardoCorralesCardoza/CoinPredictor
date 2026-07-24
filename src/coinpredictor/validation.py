@@ -26,7 +26,7 @@ from typing import Callable, Iterator
 import numpy as np
 import pandas as pd
 
-from coinpredictor.config import MODEL
+from coinpredictor.config import GATE, MODEL, GateConfig
 
 
 # --- Purged walk-forward -----------------------------------------------------
@@ -242,3 +242,134 @@ def deflated_sharpe_ratio(
 def annualized_to_period_sr(annual_sr: float, periods_per_year: int = 365) -> float:
     """Convert an annualized Sharpe back to per-period units."""
     return annual_sr / math.sqrt(periods_per_year)
+
+
+# --- Go/no-go gate -----------------------------------------------------------
+def _sharpe(returns: np.ndarray, periods_per_year: int) -> float:
+    """Annualized Sharpe of a per-period return series (0 if degenerate)."""
+    r = np.asarray(returns, dtype="float64")
+    r = r[~np.isnan(r)]
+    if r.size < 2:
+        return 0.0
+    sd = r.std(ddof=1)
+    if sd == 0:
+        return 0.0
+    return float(math.sqrt(periods_per_year) * r.mean() / sd)
+
+
+@dataclass
+class GateResult:
+    """Verdict of the pre-registered go/no-go gate. ``passed`` is the AND of
+    every individual check -- one failure blocks real-money deployment."""
+
+    passed: bool
+    checks: dict[str, bool]
+    deflated_sharpe_prob: float
+    strategy_sharpe: float
+    benchmark_sharpe: float
+    strategy_net_return: float
+    max_drawdown: float
+    reasons: list[str] = field(default_factory=list)
+
+    def summary(self) -> str:
+        verdict = "PASS -> eligible for the next stage" if self.passed else "FAIL -> NO_TRADE"
+        lines = [
+            f"Go/no-go gate: {verdict}",
+            f"  Deflated Sharpe (P edge is real): {self.deflated_sharpe_prob:.3f}",
+            f"  Strategy Sharpe:  {self.strategy_sharpe:.3f}",
+            f"  Benchmark Sharpe: {self.benchmark_sharpe:.3f}",
+            f"  Net total return: {self.strategy_net_return:.2%}",
+            f"  Max drawdown:     {self.max_drawdown:.2%}",
+        ]
+        for name, ok in self.checks.items():
+            lines.append(f"    [{'x' if ok else ' '}] {name}")
+        for reason in self.reasons:
+            lines.append(f"  - {reason}")
+        return "\n".join(lines)
+
+
+def evaluate_strategy_gate(
+    strategy_returns: pd.Series | np.ndarray,
+    benchmark_returns: pd.Series | np.ndarray,
+    *,
+    n_trials: int,
+    sr_variance: float,
+    strategy_net_return: float,
+    max_drawdown: float,
+    criteria: GateConfig = GATE,
+    periods_per_year: int = 365,
+) -> GateResult:
+    """Score a candidate strategy against the pre-registered deployment gate.
+
+    Every input is *net of realistic costs* and *out of sample* -- the gate is
+    meaningless on gross or in-sample numbers. It answers one question: does the
+    evidence justify risking real money?
+
+    Parameters
+    ----------
+    strategy_returns, benchmark_returns:
+        Per-period net returns of the candidate and of cost-matched buy & hold,
+        over the same out-of-sample window.
+    n_trials:
+        How many strategy configurations were tried before selecting this one
+        (feeds the Deflated Sharpe -- more trials => higher bar).
+    sr_variance:
+        Variance of the per-period Sharpe estimates across those trials
+        (``np.var([sr_i], ddof=1)``). 0 collapses the deflation to a plain PSR.
+    strategy_net_return:
+        Net-of-cost total return of the candidate over the window.
+    max_drawdown:
+        Realized max drawdown of the candidate (negative, e.g. -0.18).
+    criteria:
+        The pre-registered thresholds (defaults to config.GATE).
+    """
+    dsr = deflated_sharpe_ratio(strategy_returns, n_trials=n_trials, sr_variance=sr_variance)
+    strat_sharpe = _sharpe(np.asarray(strategy_returns, dtype="float64"), periods_per_year)
+    bench_sharpe = _sharpe(np.asarray(benchmark_returns, dtype="float64"), periods_per_year)
+
+    checks: dict[str, bool] = {}
+    reasons: list[str] = []
+
+    dsr_ok = (not math.isnan(dsr)) and dsr >= criteria.min_deflated_sharpe_prob
+    checks[f"deflated_sharpe >= {criteria.min_deflated_sharpe_prob:.2f}"] = dsr_ok
+    if not dsr_ok:
+        reasons.append(
+            f"Deflated Sharpe {dsr:.3f} below {criteria.min_deflated_sharpe_prob:.2f}: "
+            "edge is likely a multiple-testing artefact."
+        )
+
+    if criteria.require_beat_benchmark_sharpe:
+        beat_ok = strat_sharpe > bench_sharpe
+        checks["beats cost-matched buy & hold (Sharpe)"] = beat_ok
+        if not beat_ok:
+            reasons.append(
+                f"Strategy Sharpe {strat_sharpe:.3f} does not beat buy & hold "
+                f"{bench_sharpe:.3f}: no net-of-cost edge over simply holding BTC."
+            )
+
+    dd_ok = max_drawdown >= -abs(criteria.max_drawdown_limit)
+    checks[f"max drawdown within {criteria.max_drawdown_limit:.0%}"] = dd_ok
+    if not dd_ok:
+        reasons.append(
+            f"Max drawdown {max_drawdown:.2%} breaches the "
+            f"{-abs(criteria.max_drawdown_limit):.0%} tolerance."
+        )
+
+    ret_ok = strategy_net_return >= criteria.min_net_total_return
+    checks[f"net return >= {criteria.min_net_total_return:.0%}"] = ret_ok
+    if not ret_ok:
+        reasons.append(
+            f"Net-of-cost return {strategy_net_return:.2%} below the "
+            f"{criteria.min_net_total_return:.0%} floor."
+        )
+
+    return GateResult(
+        passed=all(checks.values()),
+        checks=checks,
+        deflated_sharpe_prob=float(dsr),
+        strategy_sharpe=strat_sharpe,
+        benchmark_sharpe=bench_sharpe,
+        strategy_net_return=float(strategy_net_return),
+        max_drawdown=float(max_drawdown),
+        reasons=reasons,
+    )
